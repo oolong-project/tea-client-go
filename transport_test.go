@@ -287,6 +287,12 @@ func TestJSONByteLimit(t *testing.T) {
 			status = http.StatusInternalServerError
 		}
 		w.WriteHeader(status)
+		if strings.Contains(r.URL.Path, "/productRelease/") {
+			// The TEA error object starts after ErrorBodyBytes: only a body
+			// that is not cut would classify it.
+			_, _ = w.Write([]byte(strings.Repeat(" ", 8192) + `{"error":"OBJECT_UNKNOWN"}`))
+			return
+		}
 		_, _ = w.Write([]byte(`{"error":"OBJECT_UNKNOWN"}` + strings.Repeat(" ", 256<<10)))
 	}))
 	e := newTestAPI(t, errSrv.URL, "", WithLimits(Limits{ErrorBodyBytes: 4096}))
@@ -297,6 +303,11 @@ func TestJSONByteLimit(t *testing.T) {
 	}
 	if _, err := e.GetComponent(ctx, compID); !errors.Is(err, ErrServer) {
 		t.Errorf("large 500: %v, want ErrServer", err)
+	}
+	// The body is cut at ErrorBodyBytes: an error object beyond it is not read.
+	_, err = e.GetProductRelease(ctx, releaseID)
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusNotFound || apiErr.TEA || errors.Is(err, ErrObjectUnknown) {
+		t.Errorf("TEA error after ErrorBodyBytes of padding: %#v, want a non-TEA 404 (body cut)", err)
 	}
 }
 
