@@ -421,7 +421,7 @@ func TestWellKnownValidation(t *testing.T) {
 		if errors.As(err, &nr) || de.Stage != StageWellKnown || len(de.Attempts) != 2 || tea404.count() != 2 {
 			t.Errorf("%v: stage %s, %d attempts, %d requests; want well-known, 2, 2", err, de.Stage, len(de.Attempts), tea404.count())
 		}
-		if !strings.Contains(de.Attempts[0].Reason, "HTTP 404 (TEA error OBJECT_UNKNOWN)") {
+		if de.Attempts[0].Reason != "HTTP 404 (TEA error)" {
 			t.Errorf("reason %q", de.Attempts[0].Reason)
 		}
 		if api.count() != 0 {
@@ -635,15 +635,34 @@ func TestDiscoverNoFailover(t *testing.T) {
 			if errors.As(err, &de) {
 				t.Errorf("a stop is not a *DiscoveryError: %v", err)
 			}
+			if got := err.Error(); strings.Count(got, "discovery") != 1 {
+				t.Errorf("error repeats its context: %q", got)
+			}
 		})
 	}
-	t.Run("401 at the well-known stage", func(t *testing.T) {
-		wk, wkSrv := served(t, status(401, "", ""))
-		_, err := discoveryClient(t, wkSrv).Discover(ctx, mustTEI(t, discTEI))
-		if !errors.Is(err, ErrUnauthorized) || wk.count() != 1 {
-			t.Errorf("%v after %d requests, want ErrUnauthorized after 1", err, wk.count())
-		}
-	})
+	// Q-4: at the well-known stage too, 400, 401 and 403 stop with *APIError
+	// after one request (the bound would allow 4).
+	for _, tc := range []struct {
+		status int
+		is     error
+	}{{400, ErrInvalidRequest}, {401, ErrUnauthorized}, {403, ErrForbidden}} {
+		t.Run(fmt.Sprintf("%d at the well-known stage", tc.status), func(t *testing.T) {
+			wk, wkSrv := served(t, status(tc.status, "application/json", `{"error":"INVALID_REQUEST"}`))
+			_, err := discoveryClient(t, wkSrv).Discover(ctx, mustTEI(t, discTEI))
+			var ae *APIError
+			var de *DiscoveryError
+			if !errors.As(err, &ae) || ae.Status != tc.status || errors.As(err, &de) || wk.count() != 1 {
+				t.Errorf("%v after %d requests, want *APIError %d after 1", err, wk.count(), tc.status)
+			}
+			if tc.status == 403 && !errors.Is(err, tc.is) {
+				t.Errorf("errors.Is(%v) does not hold", tc.is)
+			}
+			// T-8: the context appears once.
+			if got := err.Error(); strings.Count(got, "fetching .well-known/tea") != 1 {
+				t.Errorf("error repeats its context: %q", got)
+			}
+		})
+	}
 }
 
 // Case 26: the attempt bound, the backoff and cancellation.
@@ -681,6 +700,19 @@ func TestDiscoverAttemptBound(t *testing.T) {
 			a.Reason != "HTTP 503" || !errors.Is(a.Err, ErrServer) || strings.Contains(a.URL, "?") {
 			t.Errorf("attempt %d: %+v", i, a)
 		}
+	}
+
+	// A bound of 1 is the well-known fetch only (Q-2): a valid document and
+	// an endpoint that would answer, yet no /discovery request is made.
+	okAPI, okSrv := served(t, nil)
+	okAPI.h = jsonHandler(resultsJSON(okSrv.URL, releaseID))
+	okWK, okWKSrv := served(t, jsonHandler(wellKnownDoc(endpoint(okSrv.URL, `["1.0.0"]`, ""))))
+	_, err = discoveryClient(t, okWKSrv, WithDiscoveryAttempts(1, time.Millisecond)).Discover(ctx, tv)
+	if de := asDiscoveryError(t, err); de.Stage != StageAPIDiscovery || len(de.Attempts) != 0 || okWK.count() != 1 || okAPI.count() != 0 {
+		t.Errorf("bound 1: %v; %d attempts, %d well-known and %d discovery requests; want 0, 1, 0", err, len(de.Attempts), okWK.count(), okAPI.count())
+	}
+	if _, err := discoveryClient(t, okWKSrv, WithDiscoveryAttempts(2, time.Millisecond)).Discover(ctx, tv); err != nil || okAPI.count() != 1 {
+		t.Errorf("bound 2 (control): %v, %d discovery requests", err, okAPI.count())
 	}
 
 	// With attempts left over, the candidates are tried again from the
@@ -913,12 +945,19 @@ func TestDiscoverResultsCap(t *testing.T) {
 		t.Errorf("failed attempts %+v", f)
 	}
 
+	// One endpoint and the default bound of 4: the well-known fetch and the
+	// endpoint asked three times (step 6), every attempt ErrTooManyResults.
 	_, wkOne := served(t, jsonHandler(wellKnownDoc(endpoint(manySrv.URL, `["1.0.0"]`, ""))))
 	many.n.Store(0)
-	_, err = discoveryClient(t, wkOne, capped, WithDiscoveryAttempts(2, time.Millisecond)).Discover(ctx, tv)
+	_, err = discoveryClient(t, wkOne, capped).Discover(ctx, tv)
 	de := asDiscoveryError(t, err)
-	if !errors.Is(err, ErrTooManyResults) || !errors.Is(de.Attempts[0].Err, ErrTooManyResults) || many.count() != 1 {
-		t.Errorf("one endpoint, attempts exhausted: %v after %d requests", err, many.count())
+	if !errors.Is(err, ErrTooManyResults) || len(de.Attempts) != 3 || many.count() != 3 {
+		t.Errorf("one endpoint, attempts exhausted: %v, %d attempts after %d requests; want 3 and 3", err, len(de.Attempts), many.count())
+	}
+	for i, a := range de.Attempts {
+		if !errors.Is(a.Err, ErrTooManyResults) || a.URL != manySrv.URL+"/v1.0.0/discovery" {
+			t.Errorf("attempt %d: %+v", i, a)
+		}
 	}
 
 	// The default cap is 32: 33 results are refused, 32 accepted.
@@ -976,7 +1015,7 @@ func TestDiscoverByteLimits(t *testing.T) {
 			lim := WithLimits(Limits{DiscoveryBytes: 512})
 			_, err := discoveryClient(t, wkSrv, lim, WithDiscoveryAttempts(2, time.Millisecond)).Discover(ctx, tv)
 			de := asDiscoveryError(t, err)
-			if de.Stage != StageAPIDiscovery || !errors.Is(de.Attempts[0].Err, ErrResponseTooLarge) || api.count() != 1 {
+			if de.Stage != StageAPIDiscovery || !errors.Is(de.Attempts[0].Err, ErrResponseTooLarge) || !errors.Is(err, ErrResponseTooLarge) || api.count() != 1 {
 				t.Errorf("%v after %d requests", err, api.count())
 			}
 			api.h = tc.h(pad(results, 512))
@@ -995,7 +1034,14 @@ func TestDiscoveryErrorsCarryNoBody(t *testing.T) {
 	long := strings.Repeat("A", 5000)
 	api, apiSrv := served(t, nil)
 	doc := &guarded[string]{}
-	_, wkSrv := served(t, func(w http.ResponseWriter, r *http.Request) { jsonHandler(doc.get())(w, r) })
+	wkCode := &guarded[bool]{}
+	_, wkSrv := served(t, func(w http.ResponseWriter, r *http.Request) {
+		if wkCode.get() {
+			status(404, "application/json", `{"error":"`+marker+`"}`)(w, r)
+			return
+		}
+		jsonHandler(doc.get())(w, r)
+	})
 	good := wellKnownDoc(endpoint(apiSrv.URL, `["1.0.0"]`, ""))
 
 	for _, tc := range []struct{ name, doc, answer string }{
@@ -1006,9 +1052,11 @@ func TestDiscoveryErrorsCarryNoBody(t *testing.T) {
 		{"discovery uuid", good, `[{"productReleaseUuid":"` + marker + long + `","servers":[]}]`},
 		{"discovery rootUrl", good, `[{"productReleaseUuid":"` + releaseID.String() + `","servers":[{"rootUrl":"http://` + marker + long + `","versions":["1.0.0"]}]}]`},
 		{"discovery message", good, ""},
+		{"well-known TEA 404 code", "", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			doc.set(tc.doc)
+			wkCode.set(tc.name == "well-known TEA 404 code")
 			if tc.answer != "" {
 				api.h = jsonHandler(tc.answer)
 			} else {
@@ -1293,5 +1341,83 @@ func TestDiscoveryTrace(t *testing.T) {
 				t.Errorf("event %s contains %q", s, bad)
 			}
 		}
+	}
+}
+
+// Design 3.6 step 5: a DiscoverPURL answer is validated like a Discover one
+// (results cap, URL policy on every root, body shape), within the bound.
+func TestDiscoverPURLValidation(t *testing.T) {
+	ctx := context.Background()
+	const purl = "pkg:generic/example/widget@1.0.0"
+	api, apiSrv := served(t, nil)
+	base, err := ParseAPIBase(apiSrv.URL, "1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := []uuid.UUID{releaseID, otherReleaseID, productID}
+	c, err := New(WithHTTPClient(apiSrv.Client()), WithLimits(Limits{DiscoveryResults: 2}), WithDiscoveryAttempts(2, time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, body string
+		is         error
+		reason     string
+	}{
+		{"too many results", resultsJSON(apiSrv.URL, ids...), ErrTooManyResults, "more than 2 results"},
+		{"http root not under an allowance", resultsJSON("http://127.0.0.1:1/tea", releaseID), ErrInsecureURL, "URL policy"},
+		{"https root then a refused root", `[{"productReleaseUuid":"` + releaseID.String() + `","servers":[{"rootUrl":"` + apiSrv.URL + `","versions":["1.0.0"]},{"rootUrl":"http://127.0.0.1:1","versions":["1.0.0"]}]}]`, ErrInsecureURL, "server 1"},
+		{"not an array", `{"productReleaseUuid":"` + releaseID.String() + `"}`, nil, "not a JSON array"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api.h = jsonHandler(tc.body)
+			api.n.Store(0)
+			_, err := c.DiscoverPURL(ctx, base, purl)
+			de := asDiscoveryError(t, err)
+			if de.Stage != StageAPIDiscovery || len(de.Attempts) != 2 || api.count() != 2 {
+				t.Fatalf("%v: stage %s, %d attempts, %d requests; want api-discovery, 2, 2", err, de.Stage, len(de.Attempts), api.count())
+			}
+			if tc.is != nil && !errors.Is(err, tc.is) {
+				t.Errorf("errors.Is(%v) does not hold on %v", tc.is, err)
+			}
+			if !strings.Contains(de.Attempts[0].Reason, tc.reason) {
+				t.Errorf("reason %q does not name %q", de.Attempts[0].Reason, tc.reason)
+			}
+		})
+	}
+	// Control: two results are within the cap and are returned.
+	api.h = jsonHandler(resultsJSON(apiSrv.URL, ids[:2]...))
+	if res, err := c.DiscoverPURL(ctx, base, purl); err != nil || len(res) != 2 {
+		t.Errorf("two results: %d, %v", len(res), err)
+	}
+}
+
+// Design 3.6: DiscoveryError.Unwrap gives every attempt's cause, not only
+// the last one's.
+func TestDiscoveryErrorUnwrapsEveryAttempt(t *testing.T) {
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	slow, slowSrv := served(t, func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-stop:
+		}
+	})
+	failing, failingSrv := served(t, status(503, "", ""))
+	_, wkSrv := served(t, jsonHandler(wellKnownDoc(endpoint(slowSrv.URL, `["1.0.0"]`, ""), endpoint(failingSrv.URL, `["1.0.0"]`, ""))))
+	c := discoveryClient(t, wkSrv, WithLimits(Limits{AttemptTimeout: 200 * time.Millisecond}), WithDiscoveryAttempts(3, time.Millisecond))
+	_, err := c.Discover(context.Background(), mustTEI(t, discTEI))
+	de := asDiscoveryError(t, err)
+	if len(de.Attempts) != 2 || slow.count() != 1 || failing.count() != 1 {
+		t.Fatalf("%v: %d attempts, requests %d and %d", err, len(de.Attempts), slow.count(), failing.count())
+	}
+	if !errors.Is(de.Attempts[0].Err, ErrTimeout) || !errors.Is(de.Attempts[1].Err, ErrServer) {
+		t.Fatalf("attempts %+v, want ErrTimeout then ErrServer", de.Attempts)
+	}
+	if !errors.Is(err, ErrTimeout) || !errors.Is(err, ErrServer) {
+		t.Errorf("errors.Is through *DiscoveryError: ErrTimeout %v, ErrServer %v; want both", errors.Is(err, ErrTimeout), errors.Is(err, ErrServer))
+	}
+	if errs := de.Unwrap(); len(errs) != 2 {
+		t.Errorf("Unwrap gives %d errors, want 2", len(errs))
 	}
 }
