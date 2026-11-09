@@ -239,7 +239,10 @@ func (b *boundedBody) Read(p []byte) (int, error) {
 		return k, b.err
 	}
 	if err != nil {
-		if err != io.EOF {
+		// An EOF after the request's context ended is not a complete body:
+		// the transport can report a connection closed by the cancellation
+		// as a clean EOF, so a cut-off body would pass as whole.
+		if err != io.EOF || b.rctx.Err() != nil {
 			err = boundError(b.parent, b.rctx, b.url, err)
 		}
 		b.err = err

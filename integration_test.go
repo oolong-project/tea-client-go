@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	tea "github.com/oolong-project/tea-client-go"
 	"github.com/oolong-project/tea-client-go/internal/oolongtest"
 	"github.com/oolong-project/tea-client-go/teaapi"
+	"github.com/oolong-project/tea-client-go/tei"
 )
 
 // Fixture ids and values: oolong docs/tea-upgrade/fixture-reference.md.
@@ -195,4 +197,128 @@ func TestIntegrationBearerIgnored(t *testing.T) {
 	if len(spy.seen) == 0 || spy.seen[len(spy.seen)-1] != "Bearer fixture-bearer-token" {
 		t.Errorf("the bearer was not sent: %q", spy.seen)
 	}
+}
+
+// discoveryClient is the suite's client for the discovery cases: the
+// server's origin allowed over http and used as the well-known location of
+// the fixtures' domain, localhost.
+func discoveryClient(t *testing.T, srv *oolongtest.Server, extra ...tea.Option) *tea.Client {
+	t.Helper()
+	c, err := tea.New(append([]tea.Option{
+		tea.WithInsecureHTTPBase(srv.URL),
+		tea.WithWellKnownLocation("localhost", srv.URL),
+		tea.WithDiscoveryAttempts(4, 10*time.Millisecond),
+	}, extra...)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// Case 1: discovery of the fixture TEI.
+func TestIntegrationDiscover(t *testing.T) {
+	srv := oolongtest.Start(t)
+	c := discoveryClient(t, srv)
+	res, err := c.Discover(ctx(t), mustParseTEI(t, fixtureTEI))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 || res[0].ProductReleaseUUID != release100 {
+		t.Fatalf("results %+v, want one for %s", res, release100)
+	}
+	base, err := c.SelectServer(res[0])
+	if err != nil || base.RootURL() != srv.URL || base.Version() != "1.0.0" {
+		t.Fatalf("SelectServer: %v %v, want %s and 1.0.0", base, err, srv.URL)
+	}
+	a, err := c.API(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := a.GetProductRelease(ctx(t), res[0].ProductReleaseUUID)
+	if err != nil || r.Uuid != release100 {
+		t.Errorf("product release at the selected server: %v", err)
+	}
+}
+
+// Case 2: an unknown TEI is not resolved; discovery by PURL finds the
+// fixture release.
+func TestIntegrationDiscoverUnknownAndPURL(t *testing.T) {
+	srv := oolongtest.Start(t)
+	c := discoveryClient(t, srv)
+	_, err := c.Discover(ctx(t), mustParseTEI(t, "tei://localhost/uuid/"+unknownID.String()))
+	var nr *tea.NotResolvedError
+	if !errors.As(err, &nr) || nr.Code != tea.ErrorCodeObjectUnknown || nr.Base.RootURL() != srv.URL {
+		t.Fatalf("unknown TEI: %v, want *NotResolvedError OBJECT_UNKNOWN", err)
+	}
+	base, err := tea.ParseAPIBase(srv.URL, "1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.DiscoverPURL(ctx(t), base, "pkg:generic/oolong-fixture/widget@1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 || res[0].ProductReleaseUUID != release100 {
+		t.Errorf("PURL results %+v, want %s", res, release100)
+	}
+	_, err = c.DiscoverPURL(ctx(t), base, "pkg:generic/oolong-fixture/widget@9.9.9")
+	if !errors.As(err, &nr) || nr.Code != tea.ErrorCodeObjectUnknown {
+		t.Errorf("unknown PURL: %v, want *NotResolvedError", err)
+	}
+}
+
+// Case 3: a well-known document (served by a local httptest server) that
+// lists a base whose path is wrong, <server>/nope, before the right one.
+// The server answers the wrong path with its framework's 404 body,
+// {"message":...,"error":"Not Found","statusCode":404}: an application/json
+// object with a string "error", which discovery/readme.md "Unresolved
+// identifiers" defines as a TEA error response whatever the error value. So
+// discovery stops there with *NotResolvedError (unknown code "Not Found")
+// and does not fail over (OOL-5 design round 1, Q-1: the test is on the
+// shape only). If oolong changes its unmatched-route body, this case is
+// updated to expect a failed attempt and the second endpoint's result.
+func TestIntegrationDiscoverWrongPath(t *testing.T) {
+	srv := oolongtest.Start(t)
+	doc := `{"schemaVersion":1,"endpoints":[{"url":"` + srv.URL + `/nope","versions":["1.0.0"]},{"url":"` + srv.URL + `","versions":["1.0.0"]}]}`
+	wk := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(doc))
+	}))
+	t.Cleanup(wk.Close)
+	var events []tea.TraceEvent
+	var mu sync.Mutex
+	c, err := tea.New(
+		tea.WithInsecureHTTPBase(srv.URL), tea.WithInsecureHTTPBase(wk.URL),
+		tea.WithWellKnownLocation("localhost", wk.URL),
+		tea.WithDiscoveryAttempts(4, 10*time.Millisecond),
+		tea.WithTrace(func(ev tea.TraceEvent) { mu.Lock(); events = append(events, ev); mu.Unlock() }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Discover(ctx(t), mustParseTEI(t, fixtureTEI))
+	var nr *tea.NotResolvedError
+	if !errors.As(err, &nr) || nr.Base.RootURL() != srv.URL+"/nope" || nr.Code != tea.ErrorCodeUnknown || nr.RawCode != "Not Found" {
+		t.Fatalf("%v, want *NotResolvedError at %s/nope with the unknown code %q", err, srv.URL, "Not Found")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	var discoveryRequests []string
+	for _, ev := range events {
+		if ev.Kind == tea.TraceRequest && ev.Stage == tea.StageAPIDiscovery {
+			discoveryRequests = append(discoveryRequests, ev.URL)
+		}
+	}
+	if len(discoveryRequests) != 1 || discoveryRequests[0] != srv.URL+"/nope/v1.0.0/discovery" {
+		t.Errorf("discovery requests %v, want only the wrong path (no failover)", discoveryRequests)
+	}
+}
+
+func mustParseTEI(t *testing.T, s string) tei.TEI {
+	t.Helper()
+	v, err := tei.Parse(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
 }

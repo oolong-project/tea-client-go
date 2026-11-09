@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 
 	tea "github.com/oolong-project/tea-client-go"
+	"github.com/oolong-project/tea-client-go/tei"
 )
 
 // Examples have no Output line: go test compiles them but does not run
@@ -68,4 +69,33 @@ func ExampleWithInsecureHTTPBase() {
 		log.Fatal(err)
 	}
 	_ = c
+}
+
+func ExampleClient_Discover() {
+	ctx := context.Background()
+	c, err := tea.New()
+	if err != nil {
+		log.Fatal(err)
+	}
+	t, err := tei.Parse("tei://demo.rearmhq.com/uuid/b9f115fb-6688-4a3f-a262-3acc04e1fc9e")
+	if err != nil {
+		log.Fatal(err)
+	}
+	results, err := c.Discover(ctx, t) // every result, in the server's order
+	if err != nil {
+		log.Fatal(err)
+	}
+	base, err := c.SelectServer(results[0]) // a servers[] root, not the /discovery base
+	if err != nil {
+		log.Fatal(err)
+	}
+	api, err := c.API(base)
+	if err != nil {
+		log.Fatal(err)
+	}
+	release, err := api.GetProductRelease(ctx, results[0].ProductReleaseUUID)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(release.Version)
 }

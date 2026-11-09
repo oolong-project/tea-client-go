@@ -17,7 +17,8 @@ Two packages do the work:
   typed errors.
 - `tei` parses TEIs (`tei://<domain>/<type>/<id>`) exactly as written.
 
-Discovery, verified artifact downloads and the full-flow helper are being added in
+Discovery (`Client.Discover`, `Client.DiscoverPURL`, `Client.SelectServer`) is
+here; verified artifact downloads and the full-flow helper are being added in
 follow-up changes.
 
 ## Install
@@ -46,6 +47,24 @@ for p, err := range api.AllProducts(ctx, tea.ProductQuery{Page: tea.Page{PageSiz
 
 `api.Generated()` gives the generated client, on the same bounded, credential-aware
 transport, for anything not wrapped.
+
+Discovery resolves a TEI to product releases and never prompts:
+
+```go
+t, err := tei.Parse("tei://demo.rearmhq.com/uuid/b9f115fb-6688-4a3f-a262-3acc04e1fc9e")
+results, err := c.Discover(ctx, t)    // every result, in the server's order
+base, err := c.SelectServer(results[0]) // a servers[] root, not the /discovery base
+api, err := c.API(base)
+```
+
+It fetches `https://<domain>/.well-known/tea` (or the base given with
+`WithWellKnownLocation`), tries its endpoints by the greatest supported version and
+then priority, and fails over on connection and TLS errors, timeouts, `5xx`, a `404`
+that is not a TEA error and invalid answers, within `WithDiscoveryAttempts` attempts
+(every request counts, default 4) with backoff. A TEA `404` stops with
+`*NotResolvedError`; `400`, `401` and `403` stop with `*APIError`; an exhausted bound
+gives `*DiscoveryError` listing each failed attempt. An answer with more than
+`Limits.DiscoveryResults` results is refused whole.
 
 ## Every server is untrusted
 
@@ -122,6 +141,13 @@ OOLONG_SERVER_DIR=/path/to/oolong/oolong/oolong-server go test -tags integration
 
 Without either variable the integration tests skip (set `TEA_INTEGRATION_REQUIRED=1`
 to make that a failure).
+
+A live test runs against the public demo (https://demo.rearmhq.com) only when asked
+for, never in the default run:
+
+```sh
+TEA_LIVE=1 go test -tags live -run Live ./...
+```
 
 ## Versioning
 
