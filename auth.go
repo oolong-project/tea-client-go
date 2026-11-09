@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/oolong-project/tea-client-go/teaapi"
 )
@@ -40,14 +42,15 @@ func (e *TokenError) Error() string {
 // response is bounded by Limits.ErrorBodyBytes and the call by CallTimeout.
 // Neither the key id nor the secret appears in any error or trace event.
 func (a *API) RequestToken(ctx context.Context, keyID, secret string) (*teaapi.TokenResponse, error) {
-	return a.requestToken(ctx, keyID, secret)
+	return a.d.requestToken(ctx, keyID, secret)
 }
 
-// requestToken is the one token request of the client (architecture 3.7).
-func (a *API) requestToken(ctx context.Context, keyID, secret string) (*teaapi.TokenResponse, error) {
+// requestToken is the one token request of the client (architecture 3.7),
+// used by RequestToken and by the WithAPIKey recovery: POST <API base>/token.
+func (d *doer) requestToken(ctx context.Context, keyID, secret string) (*teaapi.TokenResponse, error) {
 	const op = "requesting token"
 	form := url.Values{"grant_type": {"client_credentials"}}.Encode()
-	req, err := teaapi.NewRequestTokenRequestWithBody(a.base.String()+"/", "application/x-www-form-urlencoded", strings.NewReader(form))
+	req, err := teaapi.NewRequestTokenRequestWithBody(d.apiBase.String()+"/", "application/x-www-form-urlencoded", strings.NewReader(form))
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w: %v", op, ErrInvalidArgument, err)
 	}
@@ -56,7 +59,7 @@ func (a *API) requestToken(ctx context.Context, keyID, secret string) (*teaapi.T
 	req.Header.Set("Authorization", "Basic "+basic)
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := a.d.Do(req)
+	resp, err := d.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
@@ -112,4 +115,66 @@ func parseTokenError(status int, resp *http.Response, body []byte) *TokenError {
 		te.Description = sanitize(*v.Description, maxMessageBytes)
 	}
 	return te
+}
+
+// tokenLeeway is taken off a token's expires_in before the cached token is
+// considered expired (architecture 3.7).
+const tokenLeeway = 30 * time.Second
+
+// apiKey is a WithAPIKey credential and its cached access token.
+type apiKey struct {
+	id, secret string
+
+	mu      sync.Mutex
+	token   string
+	expires time.Time // zero: no expiry known
+}
+
+// cached returns the cached token, or "" when there is none or it expired.
+func (k *apiKey) cached(now time.Time) string {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.token != "" && !k.expires.IsZero() && !now.Before(k.expires) {
+		k.token, k.expires = "", time.Time{}
+	}
+	return k.token
+}
+
+// store caches a token. expiresIn (seconds) minus tokenLeeway bounds its
+// use; a token whose expires_in leaves nothing after the leeway is not
+// cached (the retry that obtained it still uses it).
+func (k *apiKey) store(token string, expiresIn *int, now time.Time) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.token, k.expires = token, time.Time{}
+	if expiresIn != nil {
+		life := time.Duration(*expiresIn)*time.Second - tokenLeeway
+		if life <= 0 {
+			k.token = ""
+			return
+		}
+		k.expires = now.Add(life)
+	}
+}
+
+// drop forgets the cached token if it is the one a refused request carried.
+func (k *apiKey) drop(sent string) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if sent != "" && k.token == sent {
+		k.token, k.expires = "", time.Time{}
+	}
+}
+
+// bearer is the token the auth transport sends under the credential's root:
+// the configured bearer token, or for an API key the token of a recovery
+// retry (carried on the request context) or else the cached one.
+func (cr *credential) bearer(ctx context.Context, now time.Time) string {
+	if cr.key == nil {
+		return cr.token
+	}
+	if o, ok := ctx.Value(tokenOverrideKey{}).(tokenOverride); ok && o.key == cr.key {
+		return o.token
+	}
+	return cr.key.cached(now)
 }

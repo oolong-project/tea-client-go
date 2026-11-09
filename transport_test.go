@@ -352,15 +352,33 @@ func TestGeneratedIsBounded(t *testing.T) {
 	if r, err := b.Generated().DownloadLatestArtifactWithResponse(ctx, artID, nil); err != nil || len(r.Body) != 2048 {
 		t.Errorf("2 KiB on the latest download path: %v", err)
 	}
+
+	// The signature paths (/signature/download) are bounded by
+	// SignatureBytes: 2 KiB is over JSONBytes and under SignatureBytes, and
+	// over a SignatureBytes of 1 KiB.
+	sg := newTestAPI(t, srv.URL, "/tea", WithLimits(Limits{JSONBytes: 1024, SignatureBytes: 4096}))
+	if r, err := sg.Generated().DownloadArtifactSignatureByVersionWithResponse(ctx, artID, 1, nil); err != nil || len(r.Body) != 2048 {
+		t.Errorf("2 KiB on a signature path, SignatureBytes 4 KiB: %v", err)
+	}
+	if r, err := sg.Generated().DownloadLatestArtifactSignatureWithResponse(ctx, artID, nil); err != nil || len(r.Body) != 2048 {
+		t.Errorf("2 KiB on the latest signature path, SignatureBytes 4 KiB: %v", err)
+	}
+	ss := newTestAPI(t, srv.URL, "/tea", WithLimits(Limits{JSONBytes: 4096, SignatureBytes: 1024}))
+	if _, err := ss.Generated().DownloadArtifactSignatureByVersionWithResponse(ctx, artID, 1, nil); !errors.Is(err, ErrResponseTooLarge) {
+		t.Errorf("2 KiB on a signature path, SignatureBytes 1 KiB: %v, want ErrResponseTooLarge", err)
+	}
 }
 
 func TestClassify(t *testing.T) {
 	d := &doer{base: &url.URL{Scheme: "https", Host: "example.com", Path: "/tea/v1.0.0"}}
 	for path, want := range map[string]callKind{
-		"/tea/v1.0.0/artifact/" + artID.String() + "/latest/download":  kindDownload,
-		"/tea/v1.0.0/artifact/" + artID.String() + "/3/download":       kindDownload,
-		"/tea/v1.0.0/artifact/" + artID.String() + "/latest/signature": kindSignature,
-		"/tea/v1.0.0/artifact/" + artID.String() + "/3/signature":      kindSignature,
+		"/tea/v1.0.0/artifact/" + artID.String() + "/latest/download":           kindDownload,
+		"/tea/v1.0.0/artifact/" + artID.String() + "/3/download":                kindDownload,
+		"/tea/v1.0.0/artifact/" + artID.String() + "/latest/signature/download": kindSignature,
+		"/tea/v1.0.0/artifact/" + artID.String() + "/3/signature/download":      kindSignature,
+		// Not a path of the specification (its signature paths end in
+		// /signature/download): classified as JSON.
+		"/tea/v1.0.0/artifact/" + artID.String() + "/3/signature":  kindJSON,
 		"/tea/v1.0.0/discovery":                                    kindDiscovery,
 		"/tea/v1.0.0/artifact/" + artID.String() + "/3":            kindJSON,
 		"/tea/v1.0.0/product/" + productID.String():                kindJSON,

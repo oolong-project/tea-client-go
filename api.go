@@ -27,7 +27,7 @@ type API struct {
 }
 
 func newAPI(c *Client, base APIBase) (*API, error) {
-	d := &doer{c: c, base: base.url()}
+	d := &doer{c: c, base: base.url(), apiBase: base}
 	server := base.String() + "/"
 	raw, err := teaapi.NewClient(server, teaapi.WithHTTPClient(d))
 	if err != nil {
