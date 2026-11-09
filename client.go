@@ -260,7 +260,9 @@ func WithLimits(l Limits) Option {
 
 // WithDiscoveryAttempts sets the total number of discovery attempts across
 // the well-known and /discovery stages (default 4) and the first backoff
-// (default 250 ms, doubling, capped at 4 s). A zero firstBackoff keeps the
+// (default 250 ms, doubling, capped at 4 s). Every request counts, the
+// successful well-known fetch included, so Discover needs at least 2;
+// DiscoverPURL makes no well-known request. A zero firstBackoff keeps the
 // default.
 func WithDiscoveryAttempts(n int, firstBackoff time.Duration) Option {
 	return func(o *options) {
