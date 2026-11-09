@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -441,24 +440,20 @@ func classifyStatus(op string, base *APIBase, resp *http.Response, body []byte) 
 	e := mapError(op, resp, body)
 	switch resp.StatusCode {
 	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
-		return &stopError{err: fmt.Errorf("%s: %w", op, e)}
+		return &stopError{err: e} // e.Error() already starts with op
 	case http.StatusNotFound:
 		if e.TEA && base != nil {
 			return &stopError{err: &NotResolvedError{Base: *base, Code: e.Code, RawCode: e.RawCode}}
 		}
 		if e.TEA {
-			return &statusError{reason: "HTTP 404 (TEA error " + codeText(e) + ")", err: e}
+			// The reason names no code: an unknown one is server text, and
+			// a reason never carries response-body content. The code stays
+			// on the *APIError (Attempt.Err), sanitised.
+			return &statusError{reason: "HTTP 404 (TEA error)", err: e}
 		}
 		return &statusError{reason: "HTTP 404 (not a TEA error)", err: e}
 	}
 	return &statusError{reason: fmt.Sprintf("HTTP %d", resp.StatusCode), err: e}
-}
-
-func codeText(e *APIError) string {
-	if e.Code != ErrorCodeUnknown {
-		return string(e.Code)
-	}
-	return strconv.Quote(e.RawCode)
 }
 
 // wellKnown makes one well-known attempt and returns its candidates in
