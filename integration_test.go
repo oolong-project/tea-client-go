@@ -274,8 +274,9 @@ func TestIntegrationDiscoverUnknownAndPURL(t *testing.T) {
 // object with a string "error", which discovery/readme.md "Unresolved
 // identifiers" defines as a TEA error response whatever the error value. So
 // discovery stops there with *NotResolvedError (unknown code "Not Found")
-// and does not fail over. This differs from the expectation written in the
-// design's case 3 and is raised on the board as a question.
+// and does not fail over (OOL-5 design round 1, Q-1: the test is on the
+// shape only). If oolong changes its unmatched-route body, this case is
+// updated to expect a failed attempt and the second endpoint's result.
 func TestIntegrationDiscoverWrongPath(t *testing.T) {
 	srv := oolongtest.Start(t)
 	doc := `{"schemaVersion":1,"endpoints":[{"url":"` + srv.URL + `/nope","versions":["1.0.0"]},{"url":"` + srv.URL + `","versions":["1.0.0"]}]}`

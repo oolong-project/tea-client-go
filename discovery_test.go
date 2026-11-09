@@ -410,6 +410,25 @@ func TestWellKnownValidation(t *testing.T) {
 		})
 	}
 
+	// A TEA-shaped 404 at the well-known stage is a failed attempt, not
+	// *NotResolvedError (there is no API base; Q-4 of OOL-5): with 2
+	// attempts the location sees two requests.
+	t.Run("TEA-shaped 404", func(t *testing.T) {
+		tea404, tea404Srv := served(t, status(404, "application/json", `{"error":"OBJECT_UNKNOWN"}`))
+		_, err := discoveryClient(t, tea404Srv, WithDiscoveryAttempts(2, time.Millisecond)).Discover(ctx, tv)
+		var nr *NotResolvedError
+		de := asDiscoveryError(t, err)
+		if errors.As(err, &nr) || de.Stage != StageWellKnown || len(de.Attempts) != 2 || tea404.count() != 2 {
+			t.Errorf("%v: stage %s, %d attempts, %d requests; want well-known, 2, 2", err, de.Stage, len(de.Attempts), tea404.count())
+		}
+		if !strings.Contains(de.Attempts[0].Reason, "HTTP 404 (TEA error OBJECT_UNKNOWN)") {
+			t.Errorf("reason %q", de.Attempts[0].Reason)
+		}
+		if api.count() != 0 {
+			t.Errorf("%d discovery requests", api.count())
+		}
+	})
+
 	// Unknown properties are ignored, at the top and in an endpoint, as is a
 	// priority at the bounds.
 	doc.set(`{"schemaVersion":1,"future":{"a":[1]},"endpoints":[{"url":"` + a + `","versions":["1.0.0"],"priority":0,"extra":true}]}`)
@@ -436,6 +455,9 @@ func TestDiscoverFailover(t *testing.T) {
 		reason string
 	}{
 		{"503", status(503, "application/json", `{"error":"OBJECT_UNKNOWN"}`), "HTTP 503"},
+		{"429", status(429, "application/json", `{"error":"OBJECT_UNKNOWN"}`), "HTTP 429"},
+		{"204", status(204, "", ""), "HTTP 204"},
+		{"405", status(405, "", ""), "HTTP 405"},
 		{"500 empty", status(500, "", ""), "HTTP 500"},
 		{"non-TEA 404 JSON", status(404, "application/json", `{"message":"Not Found"}`), "not a TEA error"},
 		{"non-TEA 404 array", status(404, "application/json", `[{"error":"OBJECT_UNKNOWN"}]`), "not a TEA error"},
@@ -453,6 +475,7 @@ func TestDiscoverFailover(t *testing.T) {
 		{"server priority 2", jsonHandler(server(`{"rootUrl":"` + b + `","versions":["1.0.0"],"priority":2}`)), "priority"},
 		{"rootUrl with a query", jsonHandler(server(`{"rootUrl":"` + b + `?a","versions":["1.0.0"]}`)), "rootUrl pattern"},
 		{"http rootUrl not under an allowance", jsonHandler(server(`{"rootUrl":"http://127.0.0.1:1/tea","versions":["1.0.0"]}`)), "URL policy"},
+		{"https root then an http root not under an allowance (refused whole)", jsonHandler(server(`{"rootUrl":"` + b + `","versions":["1.0.0"]},{"rootUrl":"http://127.0.0.1:1/tea","versions":["1.0.0"]}`)), "server 1: rootUrl refused by the URL policy"},
 		{"rootUrl with a dot segment", jsonHandler(server(`{"rootUrl":"` + b + `/x/..","versions":["1.0.0"]}`)), "URL policy"},
 		{"a redirect to http", func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "http://127.0.0.1:1/x", http.StatusFound)
