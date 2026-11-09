@@ -3,6 +3,7 @@ package tea
 import (
 	"bytes"
 	"errors"
+	"math"
 	"slices"
 	"strings"
 	"testing"
@@ -190,6 +191,17 @@ func TestChecksumRules(t *testing.T) {
 	}
 	if _, err := verify([]teaapi.Checksum{sha256}, DownloadOptions{MaxBytes: 2}); !errors.Is(err, ErrResponseTooLarge) {
 		t.Errorf("MaxBytes 2: %v, want ErrResponseTooLarge", err)
+	}
+	// The largest caps (T-1 of test run 1: MaxBytes+1 overflowed, nothing
+	// was hashed and any input verified against the empty input's digest).
+	empty := sum(teaapi.SHA256, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+	for _, max := range []int64{math.MaxInt64, math.MaxInt64 - 1} {
+		if _, err := verify([]teaapi.Checksum{sha256}, DownloadOptions{MaxBytes: max}); err != nil {
+			t.Errorf("MaxBytes %d, genuine bytes: %v", max, err)
+		}
+		if _, err := verify([]teaapi.Checksum{empty}, DownloadOptions{MaxBytes: max}); !errors.Is(err, ErrChecksumMismatch) {
+			t.Errorf("MaxBytes %d, the empty input's digest: %v, want a mismatch", max, err)
+		}
 	}
 	if _, err := VerifyChecksums(bytes.NewReader(nil), []teaapi.Checksum{sha256}, DownloadOptions{MaxBytes: -1}); !errors.Is(err, ErrInvalidArgument) {
 		t.Errorf("MaxBytes -1: %v, want ErrInvalidArgument", err)

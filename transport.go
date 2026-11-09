@@ -333,16 +333,22 @@ func (b *boundedBody) Read(p []byte) (int, error) {
 	if b.err != nil {
 		return 0, b.err
 	}
-	if max := b.limit - b.n + 1; int64(len(p)) > max {
-		p = p[:max]
+	// Read at most one byte past the limit, to see that the body is longer.
+	// rem is never negative (n stops at the limit), and when len(p) > rem,
+	// rem+1 <= len(p) cannot overflow, whatever the limit (math.MaxInt64
+	// included).
+	rem := b.limit - b.n
+	if int64(len(p)) > rem {
+		p = p[:rem+1]
 	}
 	k, err := b.rc.Read(p)
 	if k > 0 && b.timer != nil {
 		b.timer.Reset(b.idle)
 	}
-	b.n += int64(k)
-	if b.n > b.limit {
-		k -= int(b.n - b.limit)
+	// Compared with rem, not by adding k to n first: n+k can exceed
+	// math.MaxInt64 when the limit is that large.
+	if int64(k) > rem {
+		k = int(rem)
 		b.n = b.limit
 		if b.strict {
 			b.err = fmt.Errorf("%s: more than %d bytes: %w", b.url, b.limit, ErrResponseTooLarge)
@@ -352,6 +358,7 @@ func (b *boundedBody) Read(p []byte) (int, error) {
 		b.done()
 		return k, b.err
 	}
+	b.n += int64(k)
 	if err != nil {
 		// An EOF after the request's context ended is not a complete body:
 		// the transport can report a connection closed by the cancellation

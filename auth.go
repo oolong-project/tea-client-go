@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -121,6 +122,10 @@ func parseTokenError(status int, resp *http.Response, body []byte) *TokenError {
 // considered expired (architecture 3.7).
 const tokenLeeway = 30 * time.Second
 
+// maxTokenSeconds is the largest expires_in, in seconds, a time.Duration
+// holds; a larger one is taken as this.
+const maxTokenSeconds = int64(math.MaxInt64 / time.Second)
+
 // apiKey is a WithAPIKey credential and its cached access token.
 type apiKey struct {
 	id, secret string
@@ -148,7 +153,10 @@ func (k *apiKey) store(token string, expiresIn *int, now time.Time) {
 	defer k.mu.Unlock()
 	k.token, k.expires = token, time.Time{}
 	if expiresIn != nil {
-		life := time.Duration(*expiresIn)*time.Second - tokenLeeway
+		// expires_in is server-supplied: saturate instead of letting the
+		// multiplication overflow.
+		secs := min(int64(*expiresIn), maxTokenSeconds)
+		life := time.Duration(secs)*time.Second - tokenLeeway
 		if life <= 0 {
 			k.token = ""
 			return

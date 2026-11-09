@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -111,6 +112,30 @@ func TestDownloadSource(t *testing.T) {
 		t.Errorf("external url under the root: request to %s", r.URL.Path)
 	} else if v, ok := r.Header["Authorization"]; ok {
 		t.Errorf("external url under the root received Authorization %q", v)
+	}
+
+	// An external url on another server that redirects into the credential
+	// root: no credential on the redirect hop either (an external download
+	// is anonymous on every hop).
+	bounce := newCounter(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, root+"/files/bounced.json", http.StatusFound)
+	})
+	sbounce := startHTTP(t, bounce)
+	ab := newTestAPI(t, sa.URL, "/tea", WithInsecureHTTPBase(sbounce.URL), WithBearerToken(root, bearer))
+	fb := f
+	fb.Url = strPtr(sbounce.URL + "/widget.json")
+	before = api.count()
+	if _, err := ab.DownloadArtifact(ctx, ref3, fb, io.Discard, DownloadOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if bounce.count() != 1 || api.count() != before+1 || api.lastReq().URL.Path != "/tea/files/bounced.json" {
+		t.Fatalf("external url redirected into the root: %d bounce, %d API requests", bounce.count(), api.count()-before)
+	}
+	if v, ok := api.lastReq().Header["Authorization"]; ok {
+		t.Errorf("redirect hop of an external url into the root received Authorization %q", v)
+	}
+	if v, ok := bounce.lastReq().Header["Authorization"]; ok {
+		t.Errorf("external url received Authorization %q", v)
 	}
 
 	// A 302 from the API to another origin: followed, without the header.
@@ -422,6 +447,34 @@ func TestDownloadArtifactToFile(t *testing.T) {
 	if top, _ := os.ReadDir(top); len(top) != 1 {
 		t.Errorf("%d entries at the top of the temp directory, want only a/", len(top))
 	}
+
+	// The temporary file is created in the target's directory (so the
+	// rename stays on one file system): seen there while the download
+	// stalls, gone when the idle bound ends it.
+	mode := &guarded[string]{v: "after1k"}
+	stalled := newTestAPI(t, stallServer(t, mode), "/tea", WithLimits(Limits{IdleTimeout: time.Second}))
+	sdir := t.TempDir()
+	done := make(chan error, 1)
+	go func() {
+		_, err := stalled.DownloadArtifactToFile(ctx, ref3, fmtOf(mtJSON, sha256Sum(body)), filepath.Join(sdir, "stalled.json"), DownloadOptions{})
+		done <- err
+	}()
+	seen := false
+	for deadline := time.Now().Add(900 * time.Millisecond); !seen && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		entries, _ := os.ReadDir(sdir)
+		for _, e := range entries {
+			seen = seen || strings.HasPrefix(e.Name(), ".stalled.json.tea-")
+		}
+	}
+	if !seen {
+		t.Error("no temporary file in the target's directory during the download")
+	}
+	if err := <-done; !errors.Is(err, ErrTimeout) {
+		t.Errorf("stalled download to a file: %v, want ErrTimeout", err)
+	}
+	if entries, _ := os.ReadDir(sdir); len(entries) != 0 {
+		t.Errorf("%d entries left after the stalled download", len(entries))
+	}
 }
 
 // Case 33: signatures.
@@ -571,5 +624,46 @@ func TestDownloadStatusAndLatest(t *testing.T) {
 	// Parameters compare exactly.
 	if sameMediaType(mtJSON+"; version=1.6", mtJSON+"; version=1.5") || !sameMediaType(mtJSON+";version=1.6", "APPLICATION/vnd.cyclonedx+json; version=1.6") {
 		t.Error("sameMediaType: parameters must compare exactly, type and subtype case-insensitively")
+	}
+}
+
+// The largest byte limits on the wrapped downloads (T-2 of OOL-6 test run
+// 1: DownloadOptions.MaxBytes or Limits.DownloadBytes = math.MaxInt64
+// panicked in the body reader).
+func TestDownloadExtremeLimits(t *testing.T) {
+	ctx := context.Background()
+	body := []byte(fixtureJSON)
+	srv := startHTTP(t, newCounter(serveBytes(mtJSON, body)))
+	f := fmtOf(mtJSON, sha256Sum(body))
+	bad := fmtOf(mtJSON, sum(teaapi.SHA256, flipped(sha256Sum(body).AlgValue)))
+	a := newTestAPI(t, srv.URL, "/tea")
+	big := newTestAPI(t, srv.URL, "/tea", WithLimits(Limits{DownloadBytes: math.MaxInt64, SignatureBytes: math.MaxInt64}))
+
+	for name, run := range map[string]func(teaapi.ArtifactFormat) (int64, error){
+		"MaxBytes MaxInt64": func(f teaapi.ArtifactFormat) (int64, error) {
+			r, err := a.DownloadArtifact(ctx, ref3, f, io.Discard, DownloadOptions{MaxBytes: math.MaxInt64})
+			return r.Bytes, err
+		},
+		"DownloadBytes MaxInt64": func(f teaapi.ArtifactFormat) (int64, error) {
+			r, err := big.DownloadArtifact(ctx, ref3, f, io.Discard, DownloadOptions{})
+			return r.Bytes, err
+		},
+		"to file, MaxBytes MaxInt64": func(f teaapi.ArtifactFormat) (int64, error) {
+			r, err := a.DownloadArtifactToFile(ctx, ref3, f, filepath.Join(t.TempDir(), "x.json"), DownloadOptions{MaxBytes: math.MaxInt64})
+			return r.Bytes, err
+		},
+	} {
+		if n, err := run(f); err != nil || n != int64(len(body)) {
+			t.Errorf("%s: %d bytes, %v", name, n, err)
+		}
+		if _, err := run(bad); !errors.Is(err, ErrChecksumMismatch) {
+			t.Errorf("%s, wrong checksum: %v, want a mismatch", name, err)
+		}
+	}
+	if n, err := a.DownloadSignature(ctx, ref3, f, io.Discard, DownloadOptions{MaxBytes: math.MaxInt64}); err != nil || n != int64(len(body)) {
+		t.Errorf("signature, MaxBytes MaxInt64: %d %v", n, err)
+	}
+	if n, err := big.DownloadSignature(ctx, ref3, f, io.Discard, DownloadOptions{}); err != nil || n != int64(len(body)) {
+		t.Errorf("signature, SignatureBytes MaxInt64: %d %v", n, err)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"math"
 	"net/http"
 
 	"golang.org/x/crypto/blake2b"
@@ -194,7 +195,10 @@ func VerifyChecksums(r io.Reader, sums []teaapi.Checksum, o DownloadOptions) ([]
 		return nil, err
 	}
 	src := r
-	if o.MaxBytes > 0 {
+	if o.MaxBytes > 0 && o.MaxBytes < math.MaxInt64 {
+		// One byte past the cap shows the input is longer. At
+		// math.MaxInt64 there is no room for that byte (MaxBytes+1 would
+		// overflow and read nothing), and no input can be longer anyway.
 		src = io.LimitReader(r, o.MaxBytes+1)
 	}
 	n, err := io.Copy(io.MultiWriter(p.writers()...), src)

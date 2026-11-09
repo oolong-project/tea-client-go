@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"slices"
@@ -336,6 +337,7 @@ type keyServer struct {
 	valid    guarded[string]
 	mode     guarded[string] // "", "always-invalid", "403", "basic-challenge", "redirect:<url>"
 	tokenTo  guarded[string] // when set, /token answers 307 to it
+	expires  guarded[string] // expires_in of issued tokens; "" is 3600
 	basic    string
 	tokReqs  guarded[int]
 	resource guarded[[]string] // Authorization of each product request
@@ -356,7 +358,11 @@ func newKeyServer(keyID, secret string) *keyServer {
 			}
 			tok := "issued-access-token-" + strconv.FormatInt(ks.tokens.Add(1), 10)
 			ks.valid.set(tok)
-			jsonHandler(`{"access_token":"`+tok+`","token_type":"Bearer","expires_in":3600}`)(w, r)
+			exp := ks.expires.get()
+			if exp == "" {
+				exp = "3600"
+			}
+			jsonHandler(`{"access_token":"`+tok+`","token_type":"Bearer","expires_in":`+exp+`}`)(w, r)
 			return
 		}
 		got := r.Header.Get("Authorization")
@@ -508,6 +514,18 @@ func TestAPIKeyRecovery(t *testing.T) {
 	}
 	errs = append(errs, err)
 
+	// An external artifact url under the key's root answered 401 Bearer:
+	// an anonymous request never triggers a token request.
+	body := []byte(fixtureJSON)
+	ext := fmtOf(mtJSON, sha256Sum(body))
+	ext.Url = strPtr(root + "/files/widget.json")
+	before, beforeRes = tokens(), len(resources())
+	_, err = newAPI("/tea", root).DownloadArtifact(ctx, ref3, ext, io.Discard, DownloadOptions{})
+	if !errors.Is(err, ErrUnauthorized) || tokens() != before || len(resources()) != beforeRes+1 || resources()[beforeRes] != "" {
+		t.Errorf("anonymous external url under the root: %v, %d token requests, %d requests", err, tokens()-before, len(resources())-beforeRes)
+	}
+	errs = append(errs, err)
+
 	// The automatic token request answered 307 to another port: the call
 	// fails and the target receives nothing.
 	ks.tokenTo.set(sb.URL + "/tea/v1.0.0/token")
@@ -556,6 +574,19 @@ func TestAPIKeyTokenCache(t *testing.T) {
 	if k.cached(now) != "" {
 		t.Error("expires_in 30: nothing left after the 30 s leeway, the token must not be cached")
 	}
+	// expires_in is server-supplied: values whose seconds overflow a
+	// time.Duration are saturated, not wrapped (a wrap made them negative,
+	// so the token was not cached); a negative one is not cached.
+	for _, v := range []int{math.MaxInt, int(math.MaxInt64/int64(time.Second)) + 1} {
+		k.store("big", n(v), now)
+		if k.cached(now.Add(100*365*24*time.Hour)) != "big" {
+			t.Errorf("expires_in %d: the token must be cached for a very long time", v)
+		}
+	}
+	k.store("neg", n(-5), now)
+	if k.cached(now) != "" {
+		t.Error("expires_in -5: the token must not be cached")
+	}
 	k.store("t3", nil, now)
 	if k.cached(now.Add(1000*time.Hour)) != "t3" {
 		t.Error("no expires_in: the token must be kept")
@@ -588,5 +619,26 @@ func TestWithAPIKeyOption(t *testing.T) {
 	}
 	if _, err := New(WithInsecureHTTPBase("http://example.com"), WithAPIKey("http://example.com/tea", "id", secret)); err != nil {
 		t.Errorf("http root under an allowance: %v", err)
+	}
+}
+
+// A token whose expires_in leaves nothing after the 30 s leeway is used for
+// the retry that obtained it but not cached, so the next request starts a
+// new recovery (T-5 of OOL-6 test run 1).
+func TestAPIKeyUncachedToken(t *testing.T) {
+	const keyID, secret = "uncached-id", "uncached-secret"
+	ctx := context.Background()
+	ks := newKeyServer(keyID, secret)
+	ks.expires.set("30")
+	sa := startHTTP(t, ks)
+	a := newTestAPI(t, sa.URL, "/tea", WithAPIKey(sa.URL+"/tea", keyID, secret))
+	for i := 1; i <= 2; i++ {
+		if _, err := a.GetProduct(ctx, productID); err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+	}
+	want := []string{"", "Bearer issued-access-token-1", "", "Bearer issued-access-token-2"}
+	if got := ks.resource.get(); ks.tokReqs.get() != 2 || !slices.Equal(got, want) {
+		t.Errorf("%d token requests, product requests carried %q, want %q", ks.tokReqs.get(), got, want)
 	}
 }
