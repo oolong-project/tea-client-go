@@ -1,0 +1,7 @@
+# Configuration for oapi-codegen (pinned in ../tools.mod). Run with
+# `go generate ./...` from the module root; never edit tea.gen.go by hand.
+package: teaapi
+output: tea.gen.go
+generate:
+  models: true
+  client: true
