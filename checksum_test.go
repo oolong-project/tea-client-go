@@ -3,6 +3,7 @@ package tea
 import (
 	"bytes"
 	"errors"
+	"io"
 	"math"
 	"slices"
 	"strings"
@@ -205,5 +206,47 @@ func TestChecksumRules(t *testing.T) {
 	}
 	if _, err := VerifyChecksums(bytes.NewReader(nil), []teaapi.Checksum{sha256}, DownloadOptions{MaxBytes: -1}); !errors.Is(err, ErrInvalidArgument) {
 		t.Errorf("MaxBytes -1: %v, want ErrInvalidArgument", err)
+	}
+}
+
+// countingReader serves "x" bytes until limit and counts what was read.
+type countingReader struct{ n, limit int64 }
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	if r.n >= r.limit {
+		return 0, io.EOF
+	}
+	k := int64(len(p))
+	if rest := r.limit - r.n; k > rest {
+		k = rest
+	}
+	for i := range p[:k] {
+		p[i] = 'x'
+	}
+	r.n += k
+	return int(k), nil
+}
+
+// VerifyChecksums stops reading one byte past MaxBytes (T-6 of OOL-6 test
+// run 2): a source that would serve 64 MiB is read for at most MaxBytes+1
+// bytes and the call reports ErrResponseTooLarge. Without the cap the whole
+// source would be read (and an endless one never returned).
+func TestVerifyChecksumsStopsAtMaxBytes(t *testing.T) {
+	sha := knownAnswers["abc"][1]
+	for _, max := range []int64{1, 1 << 20} {
+		src := &countingReader{limit: 64 << 20}
+		_, err := VerifyChecksums(src, []teaapi.Checksum{sha}, DownloadOptions{MaxBytes: max})
+		if !errors.Is(err, ErrResponseTooLarge) {
+			t.Errorf("MaxBytes %d: %v, want ErrResponseTooLarge", max, err)
+		}
+		if src.n > max+1 {
+			t.Errorf("MaxBytes %d: read %d bytes, want at most %d", max, src.n, max+1)
+		}
+	}
+	// Exactly MaxBytes is read whole and verified, not refused.
+	src := &countingReader{limit: 3}
+	three := sum(teaapi.SHA256, "cd2eb0837c9b4c962c22d2ff8b5441b7b45805887f051d39bf133b583baf6860") // SHA-256 of "xxx"
+	if got, err := VerifyChecksums(src, []teaapi.Checksum{three}, DownloadOptions{MaxBytes: 3}); err != nil || len(got) != 1 || src.n != 3 {
+		t.Errorf("3 bytes at MaxBytes 3: %v %v, read %d", got, err, src.n)
 	}
 }
