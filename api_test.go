@@ -211,3 +211,52 @@ func TestTypedCallUnexpectedJSON(t *testing.T) {
 		t.Errorf("path built from an uppercase uuid: %s", got)
 	}
 }
+
+// Case 16 and design 3.6: an undecodable body never reaches the error text,
+// not even the bad value a decoder error would quote.
+func TestDecodeErrorCarriesNoBody(t *testing.T) {
+	const sentinel = "SECRET-BODY-CONTENT-7f3a"
+	var body string
+	srv := startHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	a := newTestAPI(t, srv.URL, "/tea")
+	ctx := context.Background()
+	cases := map[string]struct {
+		body string
+		call func() error
+	}{
+		"time field": {
+			`{"uuid":"` + releaseID.String() + `","version":"1","createdDate":"2026-01-15T00:00:00Z","releaseDate":"` + sentinel + `","components":[],"product":"` + productID.String() + `"}`,
+			func() error { return ignore(a.GetProductRelease(ctx, releaseID)) },
+		},
+		"uuid field": {
+			`{"uuid":"` + sentinel + `","name":"p","identifiers":[]}`,
+			func() error { return ignore(a.GetProduct(ctx, productID)) },
+		},
+		"object where a string belongs": {
+			`{"uuid":"` + productID.String() + `","name":{"` + sentinel + `":1},"identifiers":[]}`,
+			func() error { return ignore(a.GetProduct(ctx, productID)) },
+		},
+		"syntax": {
+			`{"uuid":"` + productID.String() + `","name":"` + sentinel + `" ` + sentinel + `}`,
+			func() error { return ignore(a.GetProduct(ctx, productID)) },
+		},
+	}
+	for name, c := range cases {
+		body = c.body
+		err := c.call()
+		var ue *UnexpectedResponseError
+		if !errors.As(err, &ue) {
+			t.Errorf("%s: %v, want *UnexpectedResponseError", name, err)
+			continue
+		}
+		if strings.Contains(err.Error(), sentinel) || strings.Contains(err.Error(), "SECRET") {
+			t.Errorf("%s: error repeats body content: %v", name, err)
+		}
+		if !strings.Contains(ue.Reason, "teaapi.") {
+			t.Errorf("%s: reason %q does not name the type", name, ue.Reason)
+		}
+	}
+}

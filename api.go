@@ -90,7 +90,9 @@ func readBody(resp *http.Response) ([]byte, error) {
 
 // decodeBody decodes a 2xx JSON body. A missing body, "null", a value of the
 // wrong type, invalid JSON or a uuid that does not decode is an
-// *UnexpectedResponseError.
+// *UnexpectedResponseError. Its reason names only the type that failed to
+// decode: decoder errors quote body content (a time.ParseError repeats the
+// value), and no body content goes into an error (design 3.6).
 func decodeBody[T any](op string, status int, body []byte) (*T, error) {
 	trimmed := bytes.TrimSpace(body)
 	switch {
@@ -101,7 +103,7 @@ func decodeBody[T any](op string, status int, body []byte) (*T, error) {
 	}
 	v := new(T)
 	if err := json.Unmarshal(trimmed, v); err != nil {
-		return nil, unexpected(op, status, "body does not decode: "+err.Error())
+		return nil, unexpected(op, status, fmt.Sprintf("body does not decode as %T", *v))
 	}
 	return v, nil
 }
