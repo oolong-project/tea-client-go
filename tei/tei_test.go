@@ -94,8 +94,8 @@ func TestParseRefused(t *testing.T) {
 		if !errors.As(err, &se) || !strings.Contains(se.Rule, c.rule) {
 			t.Errorf("%s: rule = %v, want it to contain %q", c.name, err, c.rule)
 		}
-		if len(se.Input) > len(c.in) {
-			t.Errorf("%s: echoed input longer than input", c.name)
+		if len(se.Input) > maxEcho || !strings.HasPrefix(c.in, se.Input) {
+			t.Errorf("%s: SyntaxError.Input is %d bytes, want at most 64 bytes of the input", c.name, len(se.Input))
 		}
 		if len(c.in) > 64 && strings.Contains(err.Error(), c.in[:65]) {
 			t.Errorf("%s: error echoes more than 64 input bytes: %v", c.name, err)
@@ -163,6 +163,36 @@ func TestParseLegacyURN(t *testing.T) {
 	}
 	if tt, legacy, err := ParseCompat("tei://example.com/uuid/x"); err != nil || legacy || tt.String() != "tei://example.com/uuid/x" {
 		t.Errorf("ParseCompat tei: %q %v %v", tt.String(), legacy, err)
+	}
+}
+
+// Case 4: no error path keeps more than 64 input bytes in SyntaxError.Input.
+func TestSyntaxErrorInputTruncated(t *testing.T) {
+	long := strings.Repeat("x", 1500)
+	purl, err := Parse("tei://example.com/purl/" + long + "*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, purlErr := purl.PURL()
+	_, parseErr := Parse("tei://example.com/uuid/" + long + " ")
+	_, legacyFormErr := Parse("urn:tei:uuid:example.com:" + long)
+	_, legacyTypeErr := ParseLegacyURN("urn:tei:swid:example.com:" + long)
+	_, legacyHashErr := ParseLegacyURN("urn:tei:hash:example.com:MD5:" + long)
+	for name, err := range map[string]error{
+		"PURL": purlErr, "Parse": parseErr, "legacy form": legacyFormErr,
+		"legacy type": legacyTypeErr, "legacy hash": legacyHashErr,
+	} {
+		var se *SyntaxError
+		if !errors.As(err, &se) {
+			t.Errorf("%s: %v is not a *SyntaxError", name, err)
+			continue
+		}
+		if len(se.Input) != maxEcho {
+			t.Errorf("%s: SyntaxError.Input is %d bytes, want 64", name, len(se.Input))
+		}
+		if strings.Contains(err.Error(), strings.Repeat("x", maxEcho+1)) {
+			t.Errorf("%s: error message repeats more than 64 input bytes", name)
+		}
 	}
 }
 

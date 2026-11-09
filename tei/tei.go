@@ -74,7 +74,7 @@ func (t TEI) PURL() (string, error) {
 	}
 	b, err := base64.RawURLEncoding.DecodeString(t.id)
 	if err != nil {
-		return "", &SyntaxError{Rule: "purl id is not unpadded Base64URL", Input: t.id}
+		return "", &SyntaxError{Rule: "purl id is not unpadded Base64URL", Input: truncate(t.id)}
 	}
 	return string(b), nil
 }
@@ -117,7 +117,7 @@ func truncate(s string) string {
 	return s
 }
 
-func syntaxErr(rule, input string) error { return &SyntaxError{Rule: rule, Input: input} }
+func syntaxErr(rule, input string) error { return &SyntaxError{Rule: rule, Input: truncate(input)} }
 
 const (
 	prefix       = "tei://"
@@ -146,7 +146,7 @@ func Parse(s string) (TEI, error) {
 	}
 	if !strings.HasPrefix(s, prefix) {
 		if strings.HasPrefix(strings.ToLower(s), legacyPrefix) {
-			return TEI{}, &SyntaxError{Rule: "legacy urn:tei: form", Input: s, err: ErrLegacyForm}
+			return TEI{}, &SyntaxError{Rule: "legacy urn:tei: form", Input: truncate(s), err: ErrLegacyForm}
 		}
 		return TEI{}, syntaxErr("does not start with tei://", s)
 	}
@@ -312,7 +312,7 @@ func ParseLegacyURN(s string) (TEI, error) {
 		}
 		id = alg + ":" + hexValue
 	default:
-		return TEI{}, &SyntaxError{Rule: "legacy type " + truncate(typ) + " has no registry entry", Input: s, err: ErrLegacyTypeUnsupported}
+		return TEI{}, &SyntaxError{Rule: "legacy type " + truncate(typ) + " has no registry entry", Input: truncate(s), err: ErrLegacyTypeUnsupported}
 	}
 	return Parse(prefix + domain + "/" + typ + "/" + id)
 }
