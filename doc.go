@@ -10,14 +10,20 @@
 //   - URL policy: every URL is https, or http under a base the caller
 //     configured with WithInsecureHTTPBase. Userinfo and dot segments are
 //     refused. Nothing a server sends widens the policy.
-//   - Credentials are bound to one API root (WithBearerToken) and decided by
-//     the client's transport on every hop, redirects included; they never
-//     leave their root.
+//   - Credentials are bound to one API root (WithBearerToken, WithAPIKey)
+//     and decided by the client's transport on every hop, redirects
+//     included; they never leave their root.
 //   - Every response is bounded in bytes and in time (Limits), whatever
 //     http.Client the caller passes, and Generated() calls are bounded too.
 //   - Errors are typed (*APIError, *UnexpectedResponseError,
 //     *URLPolicyError) and match sentinels with errors.Is. No error carries a
 //     credential or a response body beyond a sanitised server message.
+//   - Discovery (Client.Discover) follows the specification, fails over
+//     within a bound and never prompts.
+//   - Downloads (API.DownloadArtifact, API.DownloadArtifactToFile) verify
+//     the published checksums while streaming and fail closed.
+//   - Client.FullFlow reads a TEI's product release, lifecycle and
+//     components, as the ReARM CLI's full_tea_flow does.
 //
 // Every server is treated as untrusted. Every call that does I/O takes a
 // context.Context, and the library's own time bounds apply inside it.
