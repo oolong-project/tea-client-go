@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -352,15 +354,33 @@ func TestGeneratedIsBounded(t *testing.T) {
 	if r, err := b.Generated().DownloadLatestArtifactWithResponse(ctx, artID, nil); err != nil || len(r.Body) != 2048 {
 		t.Errorf("2 KiB on the latest download path: %v", err)
 	}
+
+	// The signature paths (/signature/download) are bounded by
+	// SignatureBytes: 2 KiB is over JSONBytes and under SignatureBytes, and
+	// over a SignatureBytes of 1 KiB.
+	sg := newTestAPI(t, srv.URL, "/tea", WithLimits(Limits{JSONBytes: 1024, SignatureBytes: 4096}))
+	if r, err := sg.Generated().DownloadArtifactSignatureByVersionWithResponse(ctx, artID, 1, nil); err != nil || len(r.Body) != 2048 {
+		t.Errorf("2 KiB on a signature path, SignatureBytes 4 KiB: %v", err)
+	}
+	if r, err := sg.Generated().DownloadLatestArtifactSignatureWithResponse(ctx, artID, nil); err != nil || len(r.Body) != 2048 {
+		t.Errorf("2 KiB on the latest signature path, SignatureBytes 4 KiB: %v", err)
+	}
+	ss := newTestAPI(t, srv.URL, "/tea", WithLimits(Limits{JSONBytes: 4096, SignatureBytes: 1024}))
+	if _, err := ss.Generated().DownloadArtifactSignatureByVersionWithResponse(ctx, artID, 1, nil); !errors.Is(err, ErrResponseTooLarge) {
+		t.Errorf("2 KiB on a signature path, SignatureBytes 1 KiB: %v, want ErrResponseTooLarge", err)
+	}
 }
 
 func TestClassify(t *testing.T) {
 	d := &doer{base: &url.URL{Scheme: "https", Host: "example.com", Path: "/tea/v1.0.0"}}
 	for path, want := range map[string]callKind{
-		"/tea/v1.0.0/artifact/" + artID.String() + "/latest/download":  kindDownload,
-		"/tea/v1.0.0/artifact/" + artID.String() + "/3/download":       kindDownload,
-		"/tea/v1.0.0/artifact/" + artID.String() + "/latest/signature": kindSignature,
-		"/tea/v1.0.0/artifact/" + artID.String() + "/3/signature":      kindSignature,
+		"/tea/v1.0.0/artifact/" + artID.String() + "/latest/download":           kindDownload,
+		"/tea/v1.0.0/artifact/" + artID.String() + "/3/download":                kindDownload,
+		"/tea/v1.0.0/artifact/" + artID.String() + "/latest/signature/download": kindSignature,
+		"/tea/v1.0.0/artifact/" + artID.String() + "/3/signature/download":      kindSignature,
+		// Not a path of the specification (its signature paths end in
+		// /signature/download): classified as JSON.
+		"/tea/v1.0.0/artifact/" + artID.String() + "/3/signature":  kindJSON,
 		"/tea/v1.0.0/discovery":                                    kindDiscovery,
 		"/tea/v1.0.0/artifact/" + artID.String() + "/3":            kindJSON,
 		"/tea/v1.0.0/product/" + productID.String():                kindJSON,
@@ -482,5 +502,82 @@ func TestIdleTimeoutGenerated(t *testing.T) {
 	}
 	if d := time.Since(start); d < 1400*time.Millisecond {
 		t.Errorf("trickling download finished after %v; it should take about 1.5 s", d)
+	}
+}
+
+// The largest byte limits are accepted by WithLimits; reading under them
+// must neither panic nor cut a body (T-2 of OOL-6 test run 1: the
+// one-byte-past-the-limit arithmetic overflowed and sliced out of range).
+func TestExtremeByteLimits(t *testing.T) {
+	ctx := context.Background()
+	notFound := &guarded[bool]{}
+	h := newCounter(func(w http.ResponseWriter, r *http.Request) {
+		if notFound.get() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"OBJECT_UNKNOWN"}`))
+			return
+		}
+		jsonHandler(productJSON())(w, r)
+	})
+	srv := startHTTP(t, h)
+	const max = math.MaxInt64
+	a := newTestAPI(t, srv.URL, "/tea", WithLimits(Limits{
+		WellKnownBytes: max, DiscoveryBytes: max, JSONBytes: max, ErrorBodyBytes: max,
+		DownloadBytes: max, SignatureBytes: max,
+	}))
+	if p, err := a.GetProduct(ctx, productID); err != nil || p.Uuid != productID {
+		t.Errorf("JSONBytes MaxInt64: %v", err)
+	}
+	if r, err := a.Generated().DownloadArtifactByVersionWithResponse(ctx, artID, 1, nil); err != nil || string(r.Body) != productJSON() {
+		t.Errorf("Generated download, DownloadBytes MaxInt64: %v", err)
+	}
+	if r, err := a.Generated().DownloadArtifactSignatureByVersionWithResponse(ctx, artID, 1, nil); err != nil || string(r.Body) != productJSON() {
+		t.Errorf("Generated signature, SignatureBytes MaxInt64: %v", err)
+	}
+	notFound.set(true)
+	if _, err := a.GetProduct(ctx, productID); !errors.Is(err, ErrObjectUnknown) {
+		t.Errorf("ErrorBodyBytes MaxInt64: %v, want ErrObjectUnknown", err)
+	}
+
+	// Well-known and /discovery bodies, and the flow, under the same limits.
+	fs := newFlowServer(t)
+	fs.set(func() {
+		fs.results = "[" + fs.result(relA) + "]"
+		fs.releases[relA] = productReleaseJSON(relA, "1.0.0", twoComponents)
+	})
+	c := fs.client(t, WithLimits(Limits{
+		WellKnownBytes: max, DiscoveryBytes: max, JSONBytes: max, ErrorBodyBytes: max,
+		DiscoveryResults: math.MaxInt, Pages: math.MaxInt, FlowComponents: math.MaxInt, Redirects: math.MaxInt,
+	}))
+	if res, err := c.FullFlow(ctx, flowTEI, FlowOptions{}); err != nil || res.Release.Uuid != relA || len(res.Components) != 2 {
+		t.Errorf("discovery and flow with the largest limits: %v", err)
+	}
+}
+
+// boundedBody's arithmetic at the top of the int64 range, which a real body
+// cannot reach: n a few bytes below a limit of math.MaxInt64. The reader
+// cuts at the limit and reports the body too large, without n+k
+// overflowing past the limit check.
+func TestBoundedBodyNearMaxInt64(t *testing.T) {
+	for _, strict := range []bool{true, false} {
+		b := &boundedBody{
+			rc: io.NopCloser(strings.NewReader("0123456789")), limit: math.MaxInt64, n: math.MaxInt64 - 3, strict: strict,
+			parent: context.Background(), rctx: context.Background(), finish: func() {},
+		}
+		p := make([]byte, 10)
+		k, err := b.Read(p)
+		if k != 3 || b.n != math.MaxInt64 {
+			t.Errorf("strict %v: read %d bytes, n %d; want 3 bytes and n at the limit", strict, k, b.n)
+		}
+		if strict && !errors.Is(err, ErrResponseTooLarge) || !strict && err != io.EOF {
+			t.Errorf("strict %v: %v", strict, err)
+		}
+	}
+	// Under the limit nothing is cut.
+	b := &boundedBody{rc: io.NopCloser(strings.NewReader("0123456789")), limit: math.MaxInt64, strict: true,
+		parent: context.Background(), rctx: context.Background(), finish: func() {}}
+	if got, err := io.ReadAll(b); err != nil || string(got) != "0123456789" {
+		t.Errorf("limit MaxInt64: %q %v", got, err)
 	}
 }

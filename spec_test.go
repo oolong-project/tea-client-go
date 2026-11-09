@@ -6,6 +6,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"iter"
 	"os"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/oolong-project/tea-client-go/teaapi"
+	"github.com/oolong-project/tea-client-go/tei"
 )
 
 // gitBlobID is the git object id of a blob: sha1("blob <len>\0" + bytes).
@@ -101,8 +103,8 @@ var (
 	_ = teaapi.ClientInterface.RequestTokenWithFormdataBody
 )
 
-// Case 2: the tea.API wrapper set of 3.5 built by this task (the download
-// helpers of 3.8 are added with the downloads).
+// Case 2: the tea.API wrapper set of 3.5, with the download helpers of 3.8
+// and the flow helper of 3.9.
 var (
 	_ func(*API) APIBase                                                                                     = (*API).Base
 	_ func(*API, context.Context, uuid.UUID) (*teaapi.Product, error)                                        = (*API).GetProduct
@@ -137,4 +139,14 @@ var (
 	_ func(*API, context.Context, uuid.UUID, ReleasePage) iter.Seq2[teaapi.ComponentRelease, error]          = (*API).AllComponentReleasesOf
 	_ func(*API, context.Context, uuid.UUID, CollectionPage) iter.Seq2[teaapi.Collection, error]             = (*API).AllProductReleaseCollectionsOf
 	_ func(*API, context.Context, uuid.UUID, CollectionPage) iter.Seq2[teaapi.Collection, error]             = (*API).AllComponentReleaseCollectionsOf
+
+	_ func(*API, context.Context, ArtifactRef, teaapi.ArtifactFormat, io.Writer, DownloadOptions) (DownloadResult, error) = (*API).DownloadArtifact
+	_ func(*API, context.Context, ArtifactRef, teaapi.ArtifactFormat, string, DownloadOptions) (DownloadResult, error)    = (*API).DownloadArtifactToFile
+	_ func(*API, context.Context, uuid.UUID, string, io.Writer, DownloadOptions) (DownloadResult, error)                  = (*API).DownloadLatestArtifact
+	_ func(*API, context.Context, ArtifactRef, teaapi.ArtifactFormat, io.Writer, DownloadOptions) (int64, error)          = (*API).DownloadSignature
+	_ func(io.Reader, []teaapi.Checksum, DownloadOptions) ([]teaapi.ChecksumType, error)                                  = VerifyChecksums
+	_ func(*Client, context.Context, tei.TEI, FlowOptions) (*FlowResult, error)                                           = (*Client).FullFlow
+	_ func(*Client, context.Context, []DiscoveryResult) ([]Candidate, error)                                              = (*Client).Candidates
+	_ func(*Client, context.Context, *API, uuid.UUID, FlowOptions) (*FlowResult, error)                                   = (*Client).FlowFromRelease
+	_ func(string, string, string) Option                                                                                 = WithAPIKey
 )

@@ -3,10 +3,16 @@
 package tea_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -321,4 +327,185 @@ func mustParseTEI(t *testing.T, s string) tei.TEI {
 		t.Fatal(err)
 	}
 	return v
+}
+
+var (
+	widgetArtifact   = uuid.MustParse("55555555-5555-4555-8555-555555555555")
+	unsignedArtifact = uuid.MustParse("55555555-5555-4555-8555-555555555557")
+)
+
+const (
+	fixtureJSONType = "application/vnd.cyclonedx+json"
+	fixtureXMLType  = "application/vnd.cyclonedx+xml"
+	// fixtureJSONBytes is the 137-byte JSON artifact (fixture-reference.md).
+	fixtureJSONBytes = `{"bomFormat":"CycloneDX","specVersion":"1.6","version":1,"metadata":{"component":{"type":"application","name":"oolong-fixture-widget"}}}` + "\n"
+)
+
+// Case 4: the full flow of the fixture TEI.
+func TestIntegrationFullFlow(t *testing.T) {
+	srv := oolongtest.Start(t)
+	c := discoveryClient(t, srv)
+	res, err := c.FullFlow(ctx(t), mustParseTEI(t, fixtureTEI), tea.FlowOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := res.Release
+	if r.Uuid != release100 || r.Version != "1.0.0" || r.ProductName == nil || *r.ProductName != "Alpha Fixture" {
+		t.Errorf("release %v %q %v", r.Uuid, r.Version, r.ProductName)
+	}
+	if res.ReleaseCLE != nil {
+		t.Errorf("release CLE %+v, want nil (NOT_IMPLEMENTED)", res.ReleaseCLE)
+	}
+	if len(res.Components) != 1 {
+		t.Fatalf("%d components, want 1", len(res.Components))
+	}
+	comp := res.Components[0]
+	if !comp.Pinned || comp.Ref.Release == nil || *comp.Ref.Release != componentRelease || comp.Err != nil ||
+		comp.Release == nil || comp.Release.Uuid != componentRelease || comp.CLE != nil {
+		t.Errorf("component %+v", comp)
+	}
+	lc := r.LatestCollection
+	if lc.Version != 2 || len(lc.Artifacts) != 1 {
+		t.Fatalf("latest collection version %d with %d artifacts", lc.Version, len(lc.Artifacts))
+	}
+	art := lc.Artifacts[0]
+	var types []string
+	for _, f := range art.Formats {
+		types = append(types, f.MediaType)
+	}
+	if art.Uuid != widgetArtifact || art.Version != 2 || len(types) != 2 || !slices.Contains(types, fixtureJSONType) || !slices.Contains(types, fixtureXMLType) {
+		t.Errorf("artifact %v version %d formats %v", art.Uuid, art.Version, types)
+	}
+}
+
+func formatOf(t *testing.T, art *teaapi.Artifact, mediaType string) teaapi.ArtifactFormat {
+	t.Helper()
+	for _, f := range art.Formats {
+		if f.MediaType == mediaType {
+			return f
+		}
+	}
+	t.Fatalf("artifact %v version %d has no %s format", art.Uuid, art.Version, mediaType)
+	return teaapi.ArtifactFormat{}
+}
+
+// Case 7: hosted downloads and signatures of revision 2.
+func TestIntegrationDownload(t *testing.T) {
+	a := integrationAPI(t, oolongtest.Start(t))
+	ctx := ctx(t)
+	art, err := a.GetArtifact(ctx, widgetArtifact, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := tea.ArtifactRef{UUID: widgetArtifact, Version: 2}
+	jsonFormat, xmlFormat := formatOf(t, art, fixtureJSONType), formatOf(t, art, fixtureXMLType)
+
+	var out bytes.Buffer
+	res, err := a.DownloadArtifact(ctx, ref, jsonFormat, &out, tea.DownloadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Bytes != 137 || out.String() != fixtureJSONBytes || res.Source != tea.DownloadSourceServer ||
+		!slices.Equal(res.Verified, []teaapi.ChecksumType{teaapi.SHA256, teaapi.SHA1}) {
+		t.Errorf("JSON: %+v", res)
+	}
+	res, err = a.DownloadArtifact(ctx, ref, xmlFormat, io.Discard, tea.DownloadOptions{})
+	if err != nil || res.Bytes != 57 || !slices.Equal(res.Verified, []teaapi.ChecksumType{teaapi.SHA256}) {
+		t.Errorf("XML: %+v %v", res, err)
+	}
+
+	out.Reset()
+	n, err := a.DownloadSignature(ctx, ref, jsonFormat, &out, tea.DownloadOptions{})
+	if err != nil || n != 30 || out.String() != "fixture-detached-signature-v1\n" {
+		t.Errorf("JSON signature: %d %v", n, err)
+	}
+	if _, err := a.DownloadSignature(ctx, ref, xmlFormat, io.Discard, tea.DownloadOptions{}); !errors.Is(err, tea.ErrSignatureNotFound) {
+		t.Errorf("XML signature: %v, want ErrSignatureNotFound", err)
+	}
+	unsigned, err := a.GetArtifact(ctx, unsignedArtifact, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.DownloadSignature(ctx, tea.ArtifactRef{UUID: unsignedArtifact, Version: 1}, formatOf(t, unsigned, "application/json"), io.Discard, tea.DownloadOptions{}); !errors.Is(err, tea.ErrSignatureNotFound) {
+		t.Errorf("unsigned artifact signature: %v, want ErrSignatureNotFound", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "widget.json")
+	if res, err := a.DownloadArtifactToFile(ctx, ref, jsonFormat, path, tea.DownloadOptions{}); err != nil || res.Bytes != 137 {
+		t.Fatalf("to file: %+v %v", res, err)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != fixtureJSONBytes {
+		t.Errorf("file content %q %v", got, err)
+	}
+	// The latest revision is 2.
+	out.Reset()
+	if res, err := a.DownloadLatestArtifact(ctx, widgetArtifact, fixtureJSONType, &out, tea.DownloadOptions{}); err != nil || out.String() != fixtureJSONBytes {
+		t.Errorf("latest: %+v %v", res, err)
+	}
+}
+
+// fakeExternal answers https://example.invalid in-process with the fixture
+// JSON bytes and forwards every other request; it records what it sees.
+type fakeExternal struct {
+	mu        sync.Mutex
+	external  []*http.Request
+	forwarded []string // paths of forwarded requests
+	auth      []string // their Authorization headers
+}
+
+func (f *fakeExternal) RoundTrip(r *http.Request) (*http.Response, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if r.URL.Hostname() == "example.invalid" {
+		f.external = append(f.external, r.Clone(context.Background()))
+		rec := httptest.NewRecorder()
+		rec.Header().Set("Content-Type", fixtureJSONType)
+		_, _ = rec.WriteString(fixtureJSONBytes)
+		resp := rec.Result()
+		resp.Request = r
+		return resp, nil
+	}
+	f.forwarded = append(f.forwarded, r.URL.Path)
+	f.auth = append(f.auth, r.Header.Get("Authorization"))
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// Case 8: revision 1 lives at an external url; nothing leaves the machine.
+func TestIntegrationExternalDownload(t *testing.T) {
+	srv := oolongtest.Start(t)
+	fake := &fakeExternal{}
+	a := integrationAPI(t, srv, tea.WithBearerToken(srv.URL, "fixture-bearer-token"), tea.WithHTTPClient(&http.Client{Transport: fake}))
+	ctx := ctx(t)
+	art, err := a.GetArtifact(ctx, widgetArtifact, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := formatOf(t, art, fixtureJSONType)
+	if f.Url == nil || *f.Url != "https://example.invalid/fixture-widget-r1.json" {
+		t.Fatalf("revision 1 url %v", f.Url)
+	}
+	res, err := a.DownloadArtifact(ctx, tea.ArtifactRef{UUID: widgetArtifact, Version: 1}, f, io.Discard, tea.DownloadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Source != tea.DownloadSourceExternal || res.Bytes != 137 || !slices.Equal(res.Verified, []teaapi.ChecksumType{teaapi.SHA256, teaapi.SHA1}) {
+		t.Errorf("external download %+v", res)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	for _, p := range fake.forwarded {
+		if strings.HasSuffix(p, "/download") {
+			t.Errorf("the oolong server saw a download request: %s", p)
+		}
+	}
+	if len(fake.external) != 1 || fake.external[0].URL.Path != "/fixture-widget-r1.json" {
+		t.Fatalf("%d requests to the external host", len(fake.external))
+	}
+	if v, ok := fake.external[0].Header["Authorization"]; ok {
+		t.Errorf("the external host received Authorization %q", v)
+	}
+	// The control: the bearer does go to the oolong server.
+	if len(fake.auth) == 0 || fake.auth[0] != "Bearer fixture-bearer-token" {
+		t.Errorf("the oolong server's requests carried %q, want the bearer", fake.auth)
+	}
 }

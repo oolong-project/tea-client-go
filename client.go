@@ -135,9 +135,12 @@ type TraceEvent struct {
 	Wait   time.Duration // TraceBackoff
 }
 
+// credential is one configured credential: a bearer token, or an API key
+// (key set) whose access token is obtained on a Bearer challenge.
 type credential struct {
 	root  baseURL
 	token string
+	key   *apiKey
 }
 
 type options struct {
@@ -244,6 +247,38 @@ func WithBearerToken(rootURL, token string) Option {
 			return
 		}
 		o.creds = append(o.creds, credential{root: b, token: token})
+	}
+}
+
+// WithAPIKey configures an API key (key id and secret) for rootURL (an API
+// root, as in servers[].rootUrl). No token is requested up front: clients
+// do not probe /token. When a GET under rootURL is answered 401 with a
+// Bearer challenge, the client requests a token from the /token of the API
+// that made the request (it must be under rootURL), with the
+// client_credentials grant and HTTP Basic credentials, following no
+// redirect; it caches the token (until expires_in minus 30 s, when given)
+// and retries the request once with it. A 401 on a request that carried
+// the cached token drops it, and the client obtains a fresh one and retries
+// once. There is never more than one recovery per request, and none on a
+// 403. The token is sent on requests under rootURL and nowhere else, like a
+// WithBearerToken token. An http rootURL must be under a
+// WithInsecureHTTPBase allowance. The key id, the secret and the token never
+// appear in an error or a trace event.
+//
+// When several credentials cover a URL, the one with the longest root
+// applies (the first configured among equal roots).
+func WithAPIKey(rootURL, keyID, secret string) Option {
+	return func(o *options) {
+		b, err := parseBase(rootURL)
+		if err != nil {
+			o.fail("WithAPIKey: %v", err)
+			return
+		}
+		if keyID == "" || secret == "" {
+			o.fail("WithAPIKey: empty key id or secret")
+			return
+		}
+		o.creds = append(o.creds, credential{root: b, key: &apiKey{id: keyID, secret: secret}})
 	}
 }
 
