@@ -74,7 +74,8 @@ It fetches `https://<domain>/.well-known/tea` (or the base given with
 then priority, and fails over on connection and TLS errors, timeouts, `5xx`, a `404`
 that is not a TEA error and invalid answers, within `WithDiscoveryAttempts` attempts
 (every request counts, default 4) with backoff. A TEA `404` stops with
-`*NotResolvedError`; `400`, `401` and `403` stop with `*APIError`; an exhausted bound
+`*NotResolvedError`; `400`, `401` and `403` stop with `*APIError` (a `401` under an
+API-key root is first answered with a token, once); an exhausted bound
 gives `*DiscoveryError` listing each failed attempt. An answer with more than
 `Limits.DiscoveryResults` results is refused whole. `DiscoverPURL` asks one API base
 by PURL.
@@ -123,6 +124,7 @@ res, err := api.DownloadArtifactToFile(ctx, ref, art.Formats[0], "sbom.json", te
 | `WithWellKnownLocation(domain, url)` | fetch `<url>/.well-known/tea` for TEIs of `domain` |
 | `WithBearerToken(root, token)` | send a bearer token under `root` |
 | `WithAPIKey(root, id, secret)` | obtain a token with an API key when a server under `root` asks for one |
+| `WithPreemptiveAPIKey(root, id, secret)` | obtain a token with an API key before the first request under `root`, and present it on every request there |
 | `WithLimits(l)` | byte, count and time limits (below) |
 | `WithDiscoveryAttempts(n, backoff)` | discovery attempt bound and first backoff |
 | `WithTrace(f)` | observe each request, response, failed discovery attempt and backoff (for debug output) |
@@ -175,12 +177,35 @@ your context.
   well-known location or a `servers[]` root on another host never sees it.
   - `WithBearerToken(root, token)` sends the token under `root`.
   - `WithAPIKey(root, id, secret)` requests no token up front. When a `GET` under
-    `root` is answered `401` with a `Bearer` challenge, the client posts the key, with
-    the `client_credentials` grant and HTTP Basic credentials, to the `/token` of the
-    API that made the request (it must be under `root`), caches the token (until its
-    `expires_in` minus 30 s) and retries the request once. A `401` on a request that
-    carried the cached token drops it and gets one fresh token. There is never more
-    than one recovery per request, and none on `403`.
+    `root` (an API call, or a `/discovery` request of `Discover` or `DiscoverPURL`) is
+    answered `401` with a `Bearer` challenge from under `root`, the client posts the
+    key, with the `client_credentials` grant and HTTP Basic credentials, to
+    `<root>/v<version>/token` (the version of the API that made the request, whose
+    base must be under `root`), caches the token (until its `expires_in` minus 30 s)
+    and retries the request once. A `401` on a request that carried the cached token
+    drops it and gets one fresh token. There is never more than one recovery per
+    request, and none on `403`. Concurrent requests share one token request.
+  - `WithPreemptiveAPIKey(root, id, secret)` is for a server that answers an
+    anonymous caller with less instead of a `401` (a filtered listing, only the public
+    results of a discovery). Before an API sends a request under `root` (a typed or
+    `Generated()` call, a download from the server, a `/discovery` request), the
+    client makes sure it holds a token, obtaining one from `<root>/v<version>/token`
+    when it holds none, and sends it on that request; when none can be obtained, the
+    request is not sent and the error matches `ErrNoAccessToken`. A `.well-known/tea`
+    request and a redirect hop never cause a token request (they carry a token only
+    once one is held); an external artifact or signature URL never carries one. Per
+    call there is at most one token request and one retry: a `401` on a cached token
+    gets one fresh token and one retry, a `401` on a token obtained for that request
+    is returned at once, and a refused token is dropped. When the well-known document
+    lists an endpoint outside `root` and that endpoint answers first, the results are
+    its anonymous answer: `DiscoveryResult.DiscoveredAt` says who answered (or use
+    `DiscoverPURL` or the API at your root). A token is requested once per token
+    lifetime per `Client`: reuse the `Client` across calls. This departs from the
+    specification, whose `/token` description says clients do not probe it to find
+    out whether authentication is required; configuring a key for a root is the
+    caller saying it is, and against a server without `/token` every request under
+    the root fails instead of going on anonymously. `New` refuses the option on a root
+    that is also the root of another credential.
   - `API.RequestToken` exchanges a key for a token explicitly.
   - Token requests follow no redirect: a `3xx` from `/token` is an error and the key
     reaches exactly one URL.
@@ -194,8 +219,12 @@ your context.
   `*UnexpectedResponseError`, `*URLPolicyError`, `*NotResolvedError`,
   `*DiscoveryError`, `*TokenError`, `*ChecksumError`, `*AmbiguousError`, and the
   sentinels `ErrResponseTooLarge`, `ErrTimeout`, `ErrNoUsableChecksum`,
-  `ErrTooManyResults`, `ErrTooManyComponents`. Errors never carry a credential or a
-  response body beyond a sanitised, truncated server message and error code.
+  `ErrTooManyResults`, `ErrTooManyComponents`, `ErrNoAccessToken` (an API key could
+  not obtain the token a request needed; the cause is wrapped). Errors never carry a
+  credential or a response body beyond a sanitised, truncated server message and
+  error code. The refusal of an option or `ParseAPIBase` argument never repeats the
+  userinfo, query or fragment of a URL, nor any part of a value that does not parse
+  as an http or https URL or that holds `@`.
 - **Server-side use.** A TEI from an untrusted party makes the client fetch `https`
   URLs its documents choose, possibly internal addresses. A service resolving
   user-supplied TEIs should pass an `http.Client` whose dialer refuses private
@@ -234,6 +263,17 @@ refused (a second plain-http origin needs one more `WithInsecureHTTPBase`), and
 without `--usehttp` nothing is fetched over `http`. The flow reads an unpinned
 component's newest release (sorted by `createdDate` descending), where the CLI took
 the first of the default ascending listing, the oldest.
+
+The CLI at tea-client-go `v0.0.0` exchanges its API key itself (`API.RequestToken`,
+then `WithBearerToken`), because `v0.0.0` did not recover a `401` on `/discovery`
+and could not present a token unasked. From `v0.0.1`,
+`WithPreemptiveAPIKey(root, id, secret)` with the same root does both inside the
+library, refreshes the token at expiry, and marks every failure of the token request
+with `ErrNoAccessToken` (with `*TokenError` or `ErrNotImplemented` under it, as
+`RequestToken` returns them). Two differences to know: the token is requested when
+the first request under the root is about to be sent, not at start, so a TEI that
+resolves elsewhere causes no token request; and the token endpoint is at the root
+itself (`<root>/v<version>/token`).
 
 ## Regenerating `teaapi`
 
@@ -286,7 +326,9 @@ for, never in the default run:
 TEA_LIVE=1 go test -tags live -run Live ./...
 ```
 
-The repository has no CI workflow yet; run the checks above before sending a change.
+CI (`.github/workflows/test-submit-release.yaml`) runs gofmt, `go vet`, `go test`,
+the generated-code and ASCII checks and the integration tests on every push; it does
+not run `-race`, so run that before sending a change.
 
 ## Versioning
 
@@ -296,7 +338,8 @@ settled. Every exported identifier, `teaapi`'s included, is public API.
 - In `v0`, a change that alters or removes an exported identifier (a spec re-pin or a
   generator bump that changes `teaapi`, or a change to `tea`) is a new minor version
   (`v0.N+1.0`), and "Changes" below names what broke. A regenerate that changes no
-  exported identifier, and any fix that keeps the API, is a patch.
+  exported identifier, and any fix that keeps the API, is a patch, also when it adds
+  an exported identifier.
 - From `v1.0.0`, such a breaking change needs a new major version (module path
   `/v2`), so a re-pin to a TEA version with an incompatible schema is a major
   release; an additive regenerate is a minor one.
@@ -306,7 +349,24 @@ version is unknown); `WithUserAgent` replaces it.
 
 ### Changes
 
-None yet.
+`v0.0.1`:
+
+- A `401` with a `Bearer` challenge on `/discovery` under a `WithAPIKey` root is
+  recovered like one on an API call (one token request, one retry).
+- `WithPreemptiveAPIKey`: obtain the token before the first request under the root
+  and present it on every request there.
+- `ErrNoAccessToken` marks a failure to obtain an API key's token; such a failure
+  ends discovery at once, and the flow no longer reads it as "no CLE" (a `404` from
+  `/token` wraps `ErrNotImplemented`).
+- The automatic token request goes to `<root>/v<version>/token` of the key's root.
+  This differs from `v0.0.0` only for an API whose root is strictly below the key's
+  root: `v0.0.0` posted the key to that API's own `/token`.
+- Concurrent requests share one token request (`v0.0.0` made one per request
+  answered `401`).
+- Errors no longer repeat the userinfo, query or fragment of a refused URL argument,
+  nor a redirect `Location` that does not parse (now a `*URLPolicyError`).
+
+Nothing exported changed or was removed.
 
 ## Licence
 

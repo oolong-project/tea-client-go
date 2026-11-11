@@ -72,7 +72,34 @@ var (
 	ErrInsecureURL = errors.New("tea: URL refused by policy")
 	// ErrRedirectLimit: more redirects than Limits.Redirects.
 	ErrRedirectLimit = errors.New("tea: too many redirects")
+	// ErrNoAccessToken: an API-key credential (WithAPIKey,
+	// WithPreemptiveAPIKey) could not obtain the access token a request
+	// needed. The cause is reachable with errors.As and errors.Is: a
+	// *TokenError, ErrNotImplemented (the server has no /token), an
+	// *UnexpectedResponseError (a redirect from /token, among others), an
+	// *APIError, ErrTimeout, ErrInvalidArgument (an API outside the key's
+	// root) or a context error.
+	ErrNoAccessToken = errors.New("tea: no access token")
 )
+
+// The two operations an accessTokenError names.
+const (
+	opTokenUpFront  = "obtaining an access token"
+	opTokenAfter401 = "obtaining an access token after HTTP 401"
+)
+
+// accessTokenError is a failure to obtain the access token of an API-key
+// credential: it matches ErrNoAccessToken and unwraps to the cause.
+type accessTokenError struct {
+	op  string // opTokenUpFront or opTokenAfter401
+	err error
+}
+
+func (e *accessTokenError) Error() string { return e.op + ": " + e.err.Error() }
+
+func (e *accessTokenError) Unwrap() error { return e.err }
+
+func (e *accessTokenError) Is(target error) bool { return target == ErrNoAccessToken }
 
 const (
 	maxMessageBytes = 200

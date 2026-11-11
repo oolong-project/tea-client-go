@@ -204,7 +204,7 @@ func WithInsecureHTTPBase(rawURL string) Option {
 			return
 		}
 		if b.scheme != "http" {
-			o.fail("WithInsecureHTTPBase: %q is not an http URL", rawURL)
+			o.fail("WithInsecureHTTPBase: %s is not an http URL", urlSubject(rawURL, "the URL"))
 			return
 		}
 		o.insecure = append(o.insecure, b)
@@ -217,7 +217,7 @@ func WithInsecureHTTPBase(rawURL string) Option {
 func WithWellKnownLocation(domain, location string) Option {
 	return func(o *options) {
 		if _, err := tei.Parse("tei://" + domain + "/uuid/x"); err != nil {
-			o.fail("WithWellKnownLocation: %q is not a TEI domain name", domain)
+			o.fail("WithWellKnownLocation: %s is not a TEI domain name", domainSubject(domain))
 			return
 		}
 		b, err := parseBase(location)
@@ -230,6 +230,17 @@ func WithWellKnownLocation(domain, location string) Option {
 		}
 		o.wellKnown[strings.ToLower(domain)] = b
 	}
+}
+
+// domainSubject names a WithWellKnownLocation domain argument in the text
+// of its refusal: quoted and cut at 128 bytes only when it holds none of
+// "@", "/", "?" and "#" (a domain name has none of them), so a URL passed
+// there by mistake is not repeated with its userinfo, query or fragment.
+func domainSubject(domain string) string {
+	if strings.ContainsAny(domain, "@/?#") {
+		return "the domain"
+	}
+	return fmt.Sprintf("%q", truncateArg(domain))
 }
 
 // WithBearerToken sends "Authorization: Bearer <token>" on requests under
@@ -252,33 +263,73 @@ func WithBearerToken(rootURL, token string) Option {
 
 // WithAPIKey configures an API key (key id and secret) for rootURL (an API
 // root, as in servers[].rootUrl). No token is requested up front: clients
-// do not probe /token. When a GET under rootURL is answered 401 with a
-// Bearer challenge, the client requests a token from the /token of the API
-// that made the request (it must be under rootURL), with the
+// do not probe /token. When a GET under rootURL (an API call, or a
+// /discovery request of Discover or DiscoverPURL) is answered 401 with a
+// Bearer challenge from a URL under rootURL, the client requests a token
+// from <rootURL>/v<version>/token, where version is that of the API that
+// made the request (whose base must be under rootURL), with the
 // client_credentials grant and HTTP Basic credentials, following no
 // redirect; it caches the token (until expires_in minus 30 s, when given)
 // and retries the request once with it. A 401 on a request that carried
 // the cached token drops it, and the client obtains a fresh one and retries
 // once. There is never more than one recovery per request, and none on a
-// 403. The token is sent on requests under rootURL and nowhere else, like a
-// WithBearerToken token. An http rootURL must be under a
-// WithInsecureHTTPBase allowance. The key id, the secret and the token never
-// appear in an error or a trace event.
+// 403. Concurrent requests share one token request. A failure to obtain the
+// token matches ErrNoAccessToken. The token is sent on requests under
+// rootURL and nowhere else, like a WithBearerToken token. An http rootURL
+// must be under a WithInsecureHTTPBase allowance. The key id, the secret
+// and the token never appear in an error or a trace event.
 //
 // When several credentials cover a URL, the one with the longest root
 // applies (the first configured among equal roots).
+//
+// For a server that answers an anonymous caller with less instead of a
+// 401, use WithPreemptiveAPIKey.
 func WithAPIKey(rootURL, keyID, secret string) Option {
+	return withKey("WithAPIKey", rootURL, keyID, secret, tokenOnChallenge)
+}
+
+// WithPreemptiveAPIKey is WithAPIKey for a server that answers an anonymous
+// caller with less instead of a 401 (a filtered listing, only the public
+// results of a discovery): the client does not wait for a challenge. Before
+// an API sends a request to a URL under rootURL (a typed call, a Generated()
+// call, a download from the server, a /discovery request of Discover or
+// DiscoverPURL), the client makes sure it holds an access token, requesting
+// one from <rootURL>/v<version>/token when it holds none (none obtained
+// yet, expired, or dropped after a 401), and sends it on that request.
+// Concurrent requests share one token request. When the token cannot be
+// obtained the request is not sent and the error matches ErrNoAccessToken.
+//
+// A .well-known/tea request and a redirect hop never cause a token request
+// and carry the token only when one is already held; an external artifact
+// or signature URL never carries it.
+//
+// This departs from the specification's description of /token ("Clients do
+// not probe this endpoint to discover whether authentication is required"):
+// use it for a root you know to require your key. Against a server without
+// /token every request under rootURL fails (ErrNoAccessToken, wrapping
+// ErrNotImplemented), where WithAPIKey would go on without a credential.
+//
+// Everything else is as WithAPIKey: where the key and the token are sent,
+// the cache, one fresh token and one retry after a 401 on a cached token,
+// nothing on a 403. A 401 on a request whose token was obtained for it is
+// returned as it is. New refuses a rootURL that is also the root of another
+// credential.
+func WithPreemptiveAPIKey(rootURL, keyID, secret string) Option {
+	return withKey("WithPreemptiveAPIKey", rootURL, keyID, secret, tokenUpFront)
+}
+
+func withKey(name, rootURL, keyID, secret string, timing tokenTiming) Option {
 	return func(o *options) {
 		b, err := parseBase(rootURL)
 		if err != nil {
-			o.fail("WithAPIKey: %v", err)
+			o.fail("%s: %v", name, err)
 			return
 		}
 		if keyID == "" || secret == "" {
-			o.fail("WithAPIKey: empty key id or secret")
+			o.fail("%s: empty key id or secret", name)
 			return
 		}
-		o.creds = append(o.creds, credential{root: b, key: &apiKey{id: keyID, secret: secret}})
+		o.creds = append(o.creds, credential{root: b, key: &apiKey{id: keyID, secret: secret, timing: timing}})
 	}
 }
 
@@ -330,6 +381,15 @@ type Client struct {
 	limits Limits
 	hc     *http.Client // the library's copy: CheckRedirect and auth transport set
 	ua     string
+	now    func() time.Time // the clock of the token cache; nil is time.Now (a test seam)
+}
+
+// clock is the time the token cache is read and filled at.
+func (c *Client) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
 }
 
 // New builds a Client. It refuses an option value it cannot parse
@@ -344,12 +404,23 @@ func New(opts ...Option) (*Client, error) {
 	}
 	for _, cr := range c.opts.creds {
 		if cr.root.scheme == "http" && !c.allowed(cr.root) {
-			c.opts.fail("credential root %q is http and not under a WithInsecureHTTPBase allowance", cr.root.raw)
+			c.opts.fail("credential root %s is http and not under a WithInsecureHTTPBase allowance", urlSubject(cr.root.raw, "the URL"))
+		}
+	}
+	for i, cr := range c.opts.creds {
+		if cr.key == nil || cr.key.timing != tokenUpFront {
+			continue
+		}
+		for j, other := range c.opts.creds {
+			if j != i && sameRoot(cr.root, other.root) {
+				c.opts.fail("WithPreemptiveAPIKey: root %s is also the root of another credential", urlSubject(cr.root.raw, "the URL"))
+				break
+			}
 		}
 	}
 	for _, wk := range c.opts.wellKnown {
 		if wk.scheme == "http" && !c.allowed(wk) {
-			c.opts.fail("well-known location %q is http and not under a WithInsecureHTTPBase allowance", wk.raw)
+			c.opts.fail("well-known location %s is http and not under a WithInsecureHTTPBase allowance", urlSubject(wk.raw, "the URL"))
 		}
 	}
 	if len(c.opts.errs) > 0 {

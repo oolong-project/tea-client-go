@@ -148,8 +148,9 @@ func (c *Client) Candidates(ctx context.Context, results []DiscoveryResult) ([]C
 
 // FlowFromRelease reads product release release at a with its lifecycle
 // and components. The release's CLE is nil when the server answers
-// NOT_IMPLEMENTED or OBJECT_UNKNOWN; another CLE error, or any error on the
-// release itself, is returned. More component refs than
+// NOT_IMPLEMENTED or OBJECT_UNKNOWN; another CLE error (a failure to obtain
+// an access token, ErrNoAccessToken, included), or any error on the release
+// itself, is returned. More component refs than
 // Limits.FlowComponents is ErrTooManyComponents before any component
 // request (never a silent truncation). For each ref, in order: a pinned ref
 // reads that component release; an unpinned one reads the component and
@@ -236,8 +237,13 @@ func (a *API) flowComponent(ctx context.Context, ref teaapi.ComponentRef, o Flow
 	return fc
 }
 
-// optionalCLE turns NOT_IMPLEMENTED and OBJECT_UNKNOWN into no CLE.
+// optionalCLE turns NOT_IMPLEMENTED and OBJECT_UNKNOWN into no CLE. A
+// failure to obtain an access token is returned: it says nothing about the
+// release (a 404 from /token wraps ErrNotImplemented too).
 func optionalCLE(cle *teaapi.Cle, err error) (*teaapi.Cle, error) {
+	if errors.Is(err, ErrNoAccessToken) {
+		return cle, err
+	}
 	if errors.Is(err, ErrNotImplemented) || errors.Is(err, ErrObjectUnknown) {
 		return nil, nil
 	}
