@@ -1,7 +1,11 @@
 name: CI
 
 on:
-  [push]
+  push:
+    branches:
+      - '*'
+    tags-ignore:
+      - '*'
 
 # Nothing at the workflow level: each job asks for exactly what it uses.
 permissions: {}
