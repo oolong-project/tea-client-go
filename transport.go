@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/oolong-project/tea-client-go/teaapi"
 )
 
 // callKind is the kind of a request, which selects its byte limit, its time
@@ -155,10 +157,33 @@ func (d *doer) classify(u *url.URL) callKind {
 }
 
 // Do sends req with the URL policy, the byte limit and the time bound of its
-// kind applied. A 401 with a Bearer challenge on a GET under an API-key
-// root is recovered once (architecture 3.7): the client obtains a token
-// from this API's /token, caches it and retries the request with it.
+// kind applied.
+//
+// Under a WithPreemptiveAPIKey root, a request of this API (not a token
+// request, not anonymous) first takes the key's cached token or obtains one
+// from <root>/v<version>/token, and carries exactly that token; when none can
+// be obtained the request is not sent and the error matches
+// ErrNoAccessToken.
+//
+// A 401 with a Bearer challenge on a GET under an API-key root, from a URL
+// under the same root, is recovered once: the token the request carried is
+// dropped from the cache; when that token was obtained for this very request
+// the 401 is returned as it is; otherwise the client takes a fresh token
+// (one token request, shared with concurrent callers) and retries the
+// request once with it. A 401 on the retry is returned, and the token it
+// carried is dropped too. So a call makes at most one token request and one
+// retry.
 func (d *doer) Do(req *http.Request) (*http.Response, error) {
+	var up *credential
+	obtained := false
+	if up = d.upFront(req); up != nil {
+		tok, got, err := d.token(req.Context(), up, "")
+		if err != nil {
+			return nil, &accessTokenError{op: opTokenUpFront, err: err}
+		}
+		obtained = got
+		req = req.WithContext(context.WithValue(req.Context(), tokenOverrideKey{}, tokenOverride{key: up.key, token: tok}))
+	}
 	sent := &sentToken{}
 	resp, err := d.do(req, sent)
 	if err != nil || resp.StatusCode != http.StatusUnauthorized {
@@ -168,14 +193,18 @@ func (d *doer) Do(req *http.Request) (*http.Response, error) {
 	if cr == nil {
 		return resp, nil
 	}
+	cr.key.drop(sent.token)
+	if obtained && cr == up {
+		// The token is seconds old: a fresh one would fare no better.
+		return resp, nil
+	}
 	// The 401 is replaced by the outcome of the recovery: its body (cut at
 	// ErrorBodyBytes) is discarded.
 	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
-	cr.key.drop(sent.token)
-	tok, err := d.obtainToken(req.Context(), cr)
+	tok, _, err := d.token(req.Context(), cr, sent.token)
 	if err != nil {
-		return nil, fmt.Errorf("obtaining an access token after HTTP 401: %w", err)
+		return nil, &accessTokenError{op: opTokenAfter401, err: err}
 	}
 	retry := req.Clone(context.WithValue(req.Context(), tokenOverrideKey{}, tokenOverride{key: cr.key, token: tok}))
 	if req.GetBody != nil {
@@ -183,7 +212,27 @@ func (d *doer) Do(req *http.Request) (*http.Response, error) {
 			return nil, fmt.Errorf("%w: request body cannot be sent again", ErrInvalidArgument)
 		}
 	}
-	return d.do(retry, &sentToken{})
+	retrySent := &sentToken{}
+	resp, err = d.do(retry, retrySent)
+	if err == nil && resp.StatusCode == http.StatusUnauthorized && d.recoverable(retry, resp) == cr {
+		cr.key.drop(retrySent.token)
+	}
+	return resp, err
+}
+
+// upFront returns the WithPreemptiveAPIKey credential that applies to req,
+// or nil: this doer belongs to an API, the request is not a token request
+// and not anonymous, and the credential of its URL is an API key whose
+// timing is tokenUpFront.
+func (d *doer) upFront(req *http.Request) *credential {
+	if d.base == nil || kindFrom(req.Context()) == kindToken || anonymous(req.Context()) {
+		return nil
+	}
+	cr := d.c.credentialFor(req.URL)
+	if cr == nil || cr.key == nil || cr.key.timing != tokenUpFront {
+		return nil
+	}
+	return cr
 }
 
 // recoverable returns the API-key credential whose recovery a 401 triggers,
@@ -209,18 +258,24 @@ func (d *doer) recoverable(req *http.Request, resp *http.Response) *credential {
 	return cr
 }
 
-// obtainToken makes the token request of an API-key recovery to this API's
-// /token, which must be under the credential's root, and caches the token.
-func (d *doer) obtainToken(ctx context.Context, cr *credential) (string, error) {
+// token returns a token for the API-key credential cr other than refused:
+// the cached one, or one obtained now (obtained true) from
+// <root>/v<version>/token, where root is the credential's root as configured
+// and version this API's. This API's base must be under the root. Concurrent
+// callers share one token request (apiKey.turn).
+func (d *doer) token(ctx context.Context, cr *credential, refused string) (tok string, obtained bool, err error) {
 	if !under(d.base, cr.root) {
-		return "", fmt.Errorf("%w: the API base is not under the API key's root", ErrInvalidArgument)
+		return "", false, fmt.Errorf("%w: the API base is not under the API key's root", ErrInvalidArgument)
 	}
-	tr, err := d.requestToken(ctx, cr.key.id, cr.key.secret)
+	root, err := url.Parse(cr.root.raw)
 	if err != nil {
-		return "", err
+		return "", false, fmt.Errorf("%w: the API key's root does not parse", ErrInvalidArgument)
 	}
-	cr.key.store(tr.AccessToken, tr.ExpiresIn, time.Now())
-	return tr.AccessToken, nil
+	tb := APIBase{root: root, rootStr: cr.root.raw, version: d.apiBase.version}
+	td := &doer{c: d.c, base: tb.url(), apiBase: tb}
+	return cr.key.turn(ctx, refused, d.c.clock, func(ctx context.Context) (*teaapi.TokenResponse, error) {
+		return td.requestToken(ctx, cr.key.id, cr.key.secret)
+	})
 }
 
 // do is one request: no recovery.
@@ -379,7 +434,8 @@ func (b *boundedBody) Close() error {
 }
 
 // checkRedirect is the library's CheckRedirect: a kindToken request follows
-// no redirect at all; otherwise at most Limits.Redirects, each target passing
+// no redirect at all (a second line: the auth transport already removed the
+// Location of its 3xx); otherwise at most Limits.Redirects, each target passing
 // the URL policy. Credentials are the auth transport's decision on every hop.
 func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
 	if kindFrom(req.Context()) == kindToken {
@@ -422,7 +478,7 @@ func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			sent.token = ""
 		}
 		if cr := t.c.credentialFor(r.URL); cr != nil && !anonymous(r.Context()) {
-			if tok := cr.bearer(r.Context(), time.Now()); tok != "" {
+			if tok := cr.bearer(r.Context(), t.c.clock()); tok != "" {
 				r.Header.Set("Authorization", "Bearer "+tok)
 				if sent != nil {
 					sent.token = tok
@@ -434,11 +490,40 @@ func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	ev.Kind = TraceRequest
 	t.c.traceEvent(ev)
 	resp, err := t.next.RoundTrip(r)
-	if err == nil {
-		ev.Kind, ev.Status = TraceResponse, resp.StatusCode
-		t.c.traceEvent(ev)
+	if err != nil {
+		return resp, err
 	}
-	return resp, err
+	ev.Kind, ev.Status = TraceResponse, resp.StatusCode
+	t.c.traceEvent(ev)
+	return t.checkLocation(r, k, resp)
+}
+
+// checkLocation reads a redirect answer before net/http does. A token
+// request follows no redirect, so its Location is removed: net/http then
+// hands the 3xx back and no part of the target is requested or parsed. For
+// any other request a Location that does not parse is refused here with the
+// request's redacted URL, because net/http's own refusal quotes the header
+// value (userinfo, query and all) into the error.
+func (t *authTransport) checkLocation(req *http.Request, k callKind, resp *http.Response) (*http.Response, error) {
+	switch resp.StatusCode {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+	default:
+		return resp, nil
+	}
+	loc := resp.Header.Get("Location")
+	if loc == "" {
+		return resp, nil
+	}
+	if k == kindToken {
+		resp.Header.Del("Location")
+		return resp, nil
+	}
+	if _, err := req.URL.Parse(loc); err != nil {
+		_ = resp.Body.Close()
+		return nil, &URLPolicyError{URL: redact(req.URL), Reason: "redirect Location does not parse", err: ErrInsecureURL}
+	}
+	return resp, nil
 }
 
 // credentialFor returns the credential whose root u is under; the longest

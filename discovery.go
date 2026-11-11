@@ -112,7 +112,11 @@ const maxPURLBytes = 2048
 // valid answer, in the server's order; it never prompts.
 //
 // A TEA 404 ends discovery with *NotResolvedError (no failover); 400, 401 and
-// 403 end it with *APIError. Connection, TLS and DNS failures, an attempt
+// 403 end it with *APIError. A 401 with a Bearer challenge under a
+// WithAPIKey or WithPreemptiveAPIKey root is first recovered as for an API
+// call (one token request, one retry), and a failure to obtain the token
+// ends discovery with an error matching ErrNoAccessToken. Connection, TLS
+// and DNS failures, an attempt
 // exceeding Limits.AttemptTimeout, 5xx, a non-TEA 404, an invalid or
 // oversized body, or more than Limits.DiscoveryResults results are failed
 // attempts: the client backs off (250 ms doubling, capped at 4 s, by
@@ -299,7 +303,9 @@ func sortCandidates(cs []candidate) {
 // GET it makes, well-known or /discovery, successful or not, is one attempt
 // against the bound of WithDiscoveryAttempts (so the default 4 attempts of
 // at most AttemptTimeout each, plus the backoffs, bound a whole Discover at
-// about 62 s, architecture 3.4).
+// about 62 s, architecture 3.4). A /discovery attempt under an API-key root
+// can add at most CallTimeout (its token request) plus AttemptTimeout (its
+// one retry) to that. A failure to obtain a token ends the run.
 type discoveryRun struct {
 	c        *Client
 	ctx      context.Context
@@ -326,6 +332,11 @@ func (r *discoveryRun) failed(stage Stage, u *url.URL, err error) error {
 	var stop *stopError
 	if errors.As(err, &stop) {
 		return stop.err
+	}
+	if errors.Is(err, ErrNoAccessToken) {
+		// A failed token request ends the run: the key is not posted again
+		// to the next candidate or after a backoff.
+		return err
 	}
 	a := Attempt{Stage: stage, URL: redact(u), Reason: sanitize(reasonOf(err), maxMessageBytes), Err: err}
 	r.attempts = append(r.attempts, a)
@@ -403,8 +414,12 @@ func (r *discoveryRun) discover(cands []candidate, param, value string) ([]Disco
 
 // get makes one discovery GET of kind k through the bounded doer and reads
 // its body (bounded by WellKnownBytes or DiscoveryBytes, or ErrorBodyBytes
-// when not 2xx, and by AttemptTimeout).
-func (r *discoveryRun) get(k callKind, u *url.URL) (*http.Response, []byte, error) {
+// when not 2xx, and by AttemptTimeout). A /discovery GET passes its
+// candidate's base: it is sent through that API's doer, so an API-key
+// credential acts on it as on an API call (a token up front, or the
+// recovery of a 401); the well-known GET passes nil and never causes a token
+// request. A recovered GET is still one attempt.
+func (r *discoveryRun) get(k callKind, u *url.URL, base *APIBase) (*http.Response, []byte, error) {
 	req, err := http.NewRequestWithContext(withKind(r.ctx, k), http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: request does not build", ErrInvalidArgument)
@@ -412,6 +427,9 @@ func (r *discoveryRun) get(k callKind, u *url.URL) (*http.Response, []byte, erro
 	req.Header.Set("Accept", "application/json")
 	r.made++
 	d := &doer{c: r.c}
+	if base != nil {
+		d = &doer{c: r.c, base: base.url(), apiBase: *base}
+	}
 	resp, err := d.Do(req)
 	if err != nil {
 		return nil, nil, err
@@ -460,7 +478,7 @@ func classifyStatus(op string, base *APIBase, resp *http.Response, body []byte) 
 // order (none when no endpoint has a supported version).
 func (r *discoveryRun) wellKnown(u *url.URL) ([]candidate, error) {
 	const op = "fetching .well-known/tea"
-	resp, body, err := r.get(kindWellKnown, u)
+	resp, body, err := r.get(kindWellKnown, u, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -473,7 +491,7 @@ func (r *discoveryRun) wellKnown(u *url.URL) ([]candidate, error) {
 // apiDiscovery makes one /discovery attempt at base.
 func (r *discoveryRun) apiDiscovery(base APIBase, u *url.URL) ([]DiscoveryResult, error) {
 	const op = "discovery"
-	resp, body, err := r.get(kindDiscovery, u)
+	resp, body, err := r.get(kindDiscovery, u, &base)
 	if err != nil {
 		return nil, err
 	}

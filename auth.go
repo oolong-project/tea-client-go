@@ -47,7 +47,9 @@ func (a *API) RequestToken(ctx context.Context, keyID, secret string) (*teaapi.T
 }
 
 // requestToken is the one token request of the client (architecture 3.7),
-// used by RequestToken and by the WithAPIKey recovery: POST <API base>/token.
+// used by RequestToken and by the API-key credentials (through a doer whose
+// base is the key's root and the requesting API's version): POST
+// <API base>/token.
 func (d *doer) requestToken(ctx context.Context, keyID, secret string) (*teaapi.TokenResponse, error) {
 	const op = "requesting token"
 	form := url.Values{"grant_type": {"client_credentials"}}.Encode()
@@ -126,19 +128,38 @@ const tokenLeeway = 30 * time.Second
 // holds; a larger one is taken as this.
 const maxTokenSeconds = int64(math.MaxInt64 / time.Second)
 
-// apiKey is a WithAPIKey credential and its cached access token.
+// tokenTiming is when an API-key credential obtains its access token.
+type tokenTiming int
+
+const (
+	// tokenOnChallenge: after a 401 with a Bearer challenge (WithAPIKey).
+	tokenOnChallenge tokenTiming = iota
+	// tokenUpFront: before an API's request under the root is sent
+	// (WithPreemptiveAPIKey).
+	tokenUpFront
+)
+
+// apiKey is a WithAPIKey or WithPreemptiveAPIKey credential and its cached
+// access token. The zero value is a usable cache.
 type apiKey struct {
 	id, secret string
+	timing     tokenTiming
 
 	mu      sync.Mutex
 	token   string
-	expires time.Time // zero: no expiry known
+	expires time.Time     // zero: no expiry known
+	flight  chan struct{} // non-nil while a token request is in flight; closed when it ends
 }
 
 // cached returns the cached token, or "" when there is none or it expired.
 func (k *apiKey) cached(now time.Time) string {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	return k.cachedLocked(now)
+}
+
+// cachedLocked is cached with k.mu held.
+func (k *apiKey) cachedLocked(now time.Time) string {
 	if k.token != "" && !k.expires.IsZero() && !now.Before(k.expires) {
 		k.token, k.expires = "", time.Time{}
 	}
@@ -172,6 +193,55 @@ func (k *apiKey) drop(sent string) {
 	if sent != "" && k.token == sent {
 		k.token, k.expires = "", time.Time{}
 	}
+}
+
+// turn returns a live cached token other than refused (obtained false), or
+// else the token of one token request made through request (obtained true).
+// One token request at a time per key: a caller that finds one in flight
+// waits for it to end, or for its own context to end (that context's error
+// is returned), and then looks at the cache again; it makes its own request
+// when the one it waited for failed or left nothing cacheable. The request
+// runs under the context of the caller that makes it, and a failure is
+// returned to that caller only.
+func (k *apiKey) turn(ctx context.Context, refused string, now func() time.Time, request func(context.Context) (*teaapi.TokenResponse, error)) (string, bool, error) {
+	for {
+		k.mu.Lock()
+		if tok := k.cachedLocked(now()); tok != "" && tok != refused {
+			k.mu.Unlock()
+			return tok, false, nil
+		}
+		wait := k.flight
+		if wait == nil {
+			mine := make(chan struct{})
+			k.flight = mine
+			k.mu.Unlock()
+			tok, err := k.fetch(ctx, mine, now, request)
+			return tok, true, err
+		}
+		k.mu.Unlock()
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return "", false, ctx.Err()
+		}
+	}
+}
+
+// fetch makes the token request of the flight mine, caches its token, and
+// ends the flight whatever the outcome.
+func (k *apiKey) fetch(ctx context.Context, mine chan struct{}, now func() time.Time, request func(context.Context) (*teaapi.TokenResponse, error)) (string, error) {
+	defer func() {
+		k.mu.Lock()
+		k.flight = nil
+		k.mu.Unlock()
+		close(mine)
+	}()
+	tr, err := request(ctx)
+	if err != nil {
+		return "", err
+	}
+	k.store(tr.AccessToken, tr.ExpiresIn, now())
+	return tr.AccessToken, nil
 }
 
 // bearer is the token the auth transport sends under the credential's root:
