@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  [push]
+
+# Nothing at the workflow level: each job asks for exactly what it uses.
+permissions: {}
+
+env:
+  REARM_API_URL: https://demo.rearmhq.com
+  
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+
+      - name: go vet
+        run: go vet ./...
+
+      # Includes the spec pin test (spec_test.go), which checks the blob ids
+      # of spec/ and that go.mod has no tool line.
+      - name: go test
+        run: go test ./...
+
+      # Runs the generator pinned in tools.mod; the checked-in output must be
+      # what it produces.
+      - name: Generated code is current
+        run: go generate ./... && git diff --exit-code
+
+      # Coding principles: plain ASCII. spec/ is copied upstream text and
+      # teaapi/tea.gen.go is generated from it.
+      - name: ASCII check
+        run: |
+          files=$(git ls-files '*.go' '*.yaml' '*.md' | grep -v '^spec/' | grep -v '^teaapi/tea\.gen\.go$')
+          if LC_ALL=C grep -nP '[^\x00-\x7F]' $files; then
+            echo "non-ASCII characters found"
+            exit 1
+          fi
+          
+     # Integration tests on the same checkout. They need an oolong server and
+      # its tea-1.0.0 fixtures, which live in the oolong repo, not here, so the
+      # server source is fetched into _oolong/ (the go tool ignores directories
+      # starting with "_"), pinned to a fixed oolong commit so a change there
+      # cannot break this build; bump the ref on purpose. After the checks above
+      # on purpose: gofmt would list a .go file in oolong's node_modules.
+      # Removed again afterwards so the release steps see only this repo.
+      - name: Fetch oolong server
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          repository: oolong-project/oolong
+          ref: 95159225db610ab87dabe7d16e8e6c7a824c7344 # main, 2026-11-11
+          path: _oolong
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+
+      - name: Build oolong-server
+        working-directory: _oolong/oolong/oolong-server
+        run: npm ci && npm run build
+
+      - name: Integration tests
+        env:
+          OOLONG_SERVER_DIR: ${{ github.workspace }}/_oolong/oolong/oolong-server
+          TEA_INTEGRATION_REQUIRED: '1'
+        run: go test -tags integration -run Integration ./...
+
+      - name: Remove oolong server
+        if: always()
+        run: rm -rf _oolong
+
+      # Release, from the same checkout, after every test above has passed.
+      - name: Set up ReARM CLI
+        if: env.RECORD_RELEASE == 'true'
+        uses: relizaio/rearm-actions/setup-cli@f56caa74f90f3b54fd874ea70c47887a3f76ae81 # v1.9.1
+
+      - name: Resolve version from ReARM
+        id: rearm
+        if: env.RECORD_RELEASE == 'true'
+        uses: relizaio/rearm-actions/initialize@f56caa74f90f3b54fd874ea70c47887a3f76ae81 # v1.9.1
+        with:
+          rearm_api_url: ${{ env.REARM_API_URL }}
+          rearm_auth: github-oidc
+          create_component: 'true'
+
+      - name: SBOM and CodeQL
+        id: sbom
+        if: env.RECORD_RELEASE == 'true' && steps.rearm.outputs.do_build == 'true'
+        uses: relizaio/rearm-actions/sbom-sign-scan@f56caa74f90f3b54fd874ea70c47887a3f76ae81 # v1.9.1
+        with:
+          deliverable_type: FILE
+          rearm_short_version: ${{ steps.rearm.outputs.short_version }}
+          rearm_full_version: ${{ steps.rearm.outputs.full_version }}
+          enable_sbom: 'true'
+          source_code_sbom_type: go
+          enable_codeql: 'true'
+          codeql_language: go
+  
+      - name: Record release
+        if: env.RECORD_RELEASE == 'true' && steps.rearm.outputs.do_build == 'true'
+        uses: relizaio/rearm-actions/finalize@f56caa74f90f3b54fd874ea70c47887a3f76ae81 # v1.9.1
+        with:
+          rearm_api_url: ${{ env.REARM_API_URL }}
+          rearm_auth: github-oidc
+          rearm_full_version: ${{ steps.rearm.outputs.full_version }}
+          rearm_short_version: ${{ steps.rearm.outputs.short_version }}
+          rearm_build_lifecycle: ASSEMBLED
+          scearts: ${{ steps.sbom.outputs.scearts }}
+          commit_list_file: ${{ steps.rearm.outputs.commit_list_file }}
+          sce_commit: ${{ steps.rearm.outputs.sce_commit }}
