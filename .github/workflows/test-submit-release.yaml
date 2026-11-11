@@ -10,15 +10,26 @@ env:
   REARM_API_URL: https://demo.rearmhq.com
   
 jobs:
-  test:
-    name: Test
+  build:
+    name: Test and release
     runs-on: ubuntu-latest
+    # id-token: write is what github-oidc needs for the release steps; there
+    # is no ReARM secret in this workflow.
     permissions:
       contents: read
+      id-token: write
+    env:
+      REARM_API_URL: https://demo.rearmhq.com
+      # Release steps run on pushes to main only, and only once the operator
+      # has set up the OIDC trust rule on ReARM and set the repository variable
+      # REARM_RECORD_RELEASE to 'true'; until then they are skipped.
+      RECORD_RELEASE: ${{ github.ref == 'refs/heads/main' && vars.REARM_RECORD_RELEASE == 'true' }}
     steps:
+      # Full history: the release steps need it to build the commit list.
       - name: Check out
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Go
@@ -52,7 +63,7 @@ jobs:
             exit 1
           fi
           
-     # Integration tests on the same checkout. They need an oolong server and
+      # Integration tests on the same checkout. They need an oolong server and
       # its tea-1.0.0 fixtures, which live in the oolong repo, not here, so the
       # server source is fetched into _oolong/ (the go tool ignores directories
       # starting with "_"), pinned to a fixed oolong commit so a change there
