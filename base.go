@@ -87,38 +87,75 @@ func redact(u *url.URL) string {
 	return (&url.URL{Scheme: u.Scheme, Host: u.Host, RawPath: u.EscapedPath(), Path: u.Path}).String()
 }
 
-// parseBase parses a configured base (WithInsecureHTTPBase, a credential
-// root, a well-known location): an absolute http or https URL with a host and
-// no userinfo, query, fragment, trailing "/" or dot segment.
-func parseBase(raw string) (baseURL, error) {
+// urlSubject names a URL argument in the text of its refusal: the redacted
+// URL (scheme, host, port and path), quoted and cut at 128 bytes, only when
+// the argument parses as an absolute http or https URL with a host and holds
+// no "@" anywhere; otherwise noun, which names no part of the value. So a
+// refusal never repeats userinfo, a query or a fragment, nor a secret in a
+// URL that does not parse or in an argument passed in the wrong place.
+func urlSubject(raw, noun string) string {
+	if strings.Contains(raw, "@") {
+		return noun
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return baseURL{}, fmt.Errorf("%q does not parse", raw)
+		return noun
+	}
+	if s := strings.ToLower(u.Scheme); (s != "http" && s != "https") || u.Host == "" || u.Hostname() == "" {
+		return noun
+	}
+	return fmt.Sprintf("%q", truncateArg(redact(u)))
+}
+
+// rootSubject is urlSubject for a ParseAPIBase root: `root URL "<url>"`, or
+// "the root URL".
+func rootSubject(raw string) string {
+	if s := urlSubject(raw, ""); s != "" {
+		return "root URL " + s
+	}
+	return "the root URL"
+}
+
+// parseBase parses a configured base (WithInsecureHTTPBase, a credential
+// root, a well-known location): an absolute http or https URL with a host and
+// no userinfo, query, fragment, trailing "/" or dot segment. Its errors name
+// the URL only as urlSubject does.
+func parseBase(raw string) (baseURL, error) {
+	subject := urlSubject(raw, "the URL")
+	u, err := url.Parse(raw)
+	if err != nil {
+		return baseURL{}, fmt.Errorf("%s does not parse", subject)
 	}
 	scheme := strings.ToLower(u.Scheme)
 	switch {
 	case scheme != "http" && scheme != "https":
-		return baseURL{}, fmt.Errorf("%q is not an absolute http or https URL", raw)
+		return baseURL{}, fmt.Errorf("%s is not an absolute http or https URL", subject)
 	case u.Host == "" || u.Hostname() == "":
-		return baseURL{}, fmt.Errorf("%q has no host", raw)
+		return baseURL{}, fmt.Errorf("%s has no host", subject)
 	case hasNonASCII(u.Host):
-		return baseURL{}, fmt.Errorf("%q has a non-ASCII host", raw)
+		return baseURL{}, fmt.Errorf("%s has a non-ASCII host", subject)
 	case u.User != nil:
-		return baseURL{}, fmt.Errorf("%q has userinfo", raw)
+		return baseURL{}, fmt.Errorf("%s has userinfo", subject)
 	case u.RawQuery != "" || u.ForceQuery:
-		return baseURL{}, fmt.Errorf("%q has a query", raw)
+		return baseURL{}, fmt.Errorf("%s has a query", subject)
 	case u.Fragment != "" || strings.Contains(raw, "#"):
-		return baseURL{}, fmt.Errorf("%q has a fragment", raw)
+		return baseURL{}, fmt.Errorf("%s has a fragment", subject)
 	case strings.HasSuffix(u.EscapedPath(), "/"):
-		return baseURL{}, fmt.Errorf("%q ends with /", raw)
+		return baseURL{}, fmt.Errorf("%s ends with /", subject)
 	case hasDotSegment(u.EscapedPath()):
-		return baseURL{}, fmt.Errorf("%q has a dot segment", raw)
+		return baseURL{}, fmt.Errorf("%s has a dot segment", subject)
 	}
 	port := u.Port()
 	if port == "" {
 		port = defaultPort(scheme)
 	}
 	return baseURL{raw: raw, scheme: scheme, host: strings.ToLower(u.Hostname()), port: port, path: u.EscapedPath()}, nil
+}
+
+// sameRoot reports whether two parsed bases are the same root: scheme,
+// host, port and path.
+func sameRoot(a, b baseURL) bool {
+	return a.scheme == b.scheme && a.host == b.host && a.port == b.port && a.path == b.path
 }
 
 // under reports whether u is under base b (architecture D4): same scheme,
@@ -194,17 +231,18 @@ type APIBase struct {
 
 // ParseAPIBase validates rootURL against the specification's rootUrl
 // pattern (absolute http or https, no userinfo, query, fragment or trailing
-// "/") and refuses dot segments with a *URLPolicyError; version must be a
+// "/"; a refusal never repeats userinfo, a query or a fragment) and refuses
+// dot segments with a *URLPolicyError; version must be a
 // SemVer 2.0.0 version that is one of SupportedVersions once build metadata
 // is ignored. The version is kept verbatim for paths. Whether an http root
 // may be used is decided by Client.API, against the client's allowances.
 func ParseAPIBase(rootURL, version string) (APIBase, error) {
 	if !rootURLPattern.MatchString(rootURL) {
-		return APIBase{}, fmt.Errorf("%w: root URL %q does not match the rootUrl pattern", ErrInvalidArgument, truncateArg(rootURL))
+		return APIBase{}, fmt.Errorf("%w: %s does not match the rootUrl pattern", ErrInvalidArgument, rootSubject(rootURL))
 	}
 	u, err := url.Parse(rootURL)
 	if err != nil {
-		return APIBase{}, fmt.Errorf("%w: root URL %q does not parse", ErrInvalidArgument, truncateArg(rootURL))
+		return APIBase{}, fmt.Errorf("%w: %s does not parse", ErrInvalidArgument, rootSubject(rootURL))
 	}
 	if hasDotSegment(u.EscapedPath()) {
 		return APIBase{}, policyError(u, "path has a dot segment")
