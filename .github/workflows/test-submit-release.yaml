@@ -20,10 +20,6 @@ jobs:
       id-token: write
     env:
       REARM_API_URL: https://demo.rearmhq.com
-      # Release steps run on pushes to main only, and only once the operator
-      # has set up the OIDC trust rule on ReARM and set the repository variable
-      # REARM_RECORD_RELEASE to 'true'; until then they are skipped.
-      RECORD_RELEASE: ${{ github.ref == 'refs/heads/main' && vars.REARM_RECORD_RELEASE == 'true' }}
     steps:
       # Full history: the release steps need it to build the commit list.
       - name: Check out
@@ -99,12 +95,10 @@ jobs:
 
       # Release, from the same checkout, after every test above has passed.
       - name: Set up ReARM CLI
-        if: env.RECORD_RELEASE == 'true'
         uses: relizaio/rearm-actions/setup-cli@f56caa74f90f3b54fd874ea70c47887a3f76ae81 # v1.9.1
 
       - name: Resolve version from ReARM
         id: rearm
-        if: env.RECORD_RELEASE == 'true'
         uses: relizaio/rearm-actions/initialize@f56caa74f90f3b54fd874ea70c47887a3f76ae81 # v1.9.1
         with:
           rearm_api_url: ${{ env.REARM_API_URL }}
@@ -113,7 +107,7 @@ jobs:
 
       - name: SBOM and CodeQL
         id: sbom
-        if: env.RECORD_RELEASE == 'true' && steps.rearm.outputs.do_build == 'true'
+        if: steps.rearm.outputs.do_build == 'true'
         uses: relizaio/rearm-actions/sbom-sign-scan@f56caa74f90f3b54fd874ea70c47887a3f76ae81 # v1.9.1
         with:
           deliverable_type: FILE
@@ -125,7 +119,7 @@ jobs:
           codeql_language: go
   
       - name: Record release
-        if: env.RECORD_RELEASE == 'true' && steps.rearm.outputs.do_build == 'true'
+        if: steps.rearm.outputs.do_build == 'true'
         uses: relizaio/rearm-actions/finalize@f56caa74f90f3b54fd874ea70c47887a3f76ae81 # v1.9.1
         with:
           rearm_api_url: ${{ env.REARM_API_URL }}
